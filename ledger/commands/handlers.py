@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
+from ledger.domain.aggregates.agent_session import AgentSessionAggregate
 from ledger.domain.aggregates.loan_application import LoanApplicationAggregate
 from ledger.domain.errors import DomainError
 from ledger.schema.events import (
@@ -25,7 +26,12 @@ from ledger.schema.events import (
 )
 
 
-class SubmitApplicationCommand(BaseModel):
+class TraceableCommand(BaseModel):
+    correlation_id: str | None = None
+    causation_id: str | None = None
+
+
+class SubmitApplicationCommand(TraceableCommand):
     application_id: str
     applicant_id: str
     requested_amount_usd: Decimal
@@ -47,13 +53,16 @@ class SubmitApplicationCommand(BaseModel):
     requested_by: str = "system"
 
 
-class CreditAnalysisCompletedCommand(BaseModel):
+class CreditAnalysisCompletedCommand(TraceableCommand):
     application_id: str
     triggered_by_event_id: str
     requested_at: datetime
+    session_id: str | None = None
+    agent_type: AgentType = AgentType.CREDIT_ANALYSIS
+    model_version: str | None = None
 
 
-class FraudScreeningCompletedCommand(BaseModel):
+class FraudScreeningCompletedCommand(TraceableCommand):
     application_id: str
     triggered_by_event_id: str
     requested_at: datetime
@@ -63,7 +72,7 @@ class FraudScreeningCompletedCommand(BaseModel):
     )
 
 
-class ComplianceCheckCompletedCommand(BaseModel):
+class ComplianceCheckCompletedCommand(TraceableCommand):
     application_id: str
     triggered_by_event_id: str
     requested_at: datetime
@@ -72,7 +81,7 @@ class ComplianceCheckCompletedCommand(BaseModel):
     adverse_action_codes: list[str] = Field(default_factory=list)
 
 
-class DecisionGeneratedCommand(BaseModel):
+class DecisionGeneratedCommand(TraceableCommand):
     application_id: str
     orchestrator_session_id: str
     recommendation: str
@@ -87,7 +96,7 @@ class DecisionGeneratedCommand(BaseModel):
     assigned_to: str | None = None
 
 
-class HumanReviewCompletedCommand(BaseModel):
+class HumanReviewCompletedCommand(TraceableCommand):
     application_id: str
     reviewer_id: str
     override: bool
@@ -104,9 +113,11 @@ class HumanReviewCompletedCommand(BaseModel):
     adverse_action_codes: list[str] = Field(default_factory=list)
 
 
-async def _stream_has_event(store, stream_id: str, event_type: str) -> bool:
-    events = await store.load_stream(stream_id)
-    return any(event.get("event_type") == event_type for event in events)
+def _trace_kwargs(cmd: TraceableCommand) -> dict:
+    return {
+        "correlation_id": cmd.correlation_id,
+        "causation_id": cmd.causation_id,
+    }
 
 
 async def handle_submit_application(store, cmd: SubmitApplicationCommand) -> list[int]:
@@ -136,15 +147,20 @@ async def handle_submit_application(store, cmd: SubmitApplicationCommand) -> lis
         f"loan-{cmd.application_id}",
         [submitted, docs_requested],
         expected_version=app.version,
+        **_trace_kwargs(cmd),
     )
 
 
 async def handle_credit_analysis_completed(store, cmd: CreditAnalysisCompletedCommand) -> list[int]:
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
-    if not await _stream_has_event(store, f"docpkg-{cmd.application_id}", "PackageReadyForAnalysis"):
-        raise DomainError("Document package must be ready before credit analysis can complete")
-    app.mark_package_ready()
-    app.assert_awaiting_credit_analysis()
+    await app.assert_credit_analysis_completion_ready(store)
+
+    if cmd.session_id is not None:
+        session = await AgentSessionAggregate.load(store, cmd.agent_type.value, cmd.session_id)
+        session.assert_started()
+        session.assert_model_version_locked(cmd.model_version)
+        if session.application_id is not None and session.application_id != cmd.application_id:
+            raise DomainError("Credit analysis session does not belong to this application")
 
     fraud_requested = FraudScreeningRequested(
         application_id=cmd.application_id,
@@ -155,6 +171,7 @@ async def handle_credit_analysis_completed(store, cmd: CreditAnalysisCompletedCo
         f"loan-{cmd.application_id}",
         [fraud_requested],
         expected_version=app.version,
+        **_trace_kwargs(cmd),
     )
 
 
@@ -173,6 +190,7 @@ async def handle_fraud_screening_completed(store, cmd: FraudScreeningCompletedCo
         f"loan-{cmd.application_id}",
         [compliance_requested],
         expected_version=app.version,
+        **_trace_kwargs(cmd),
     )
 
 
@@ -193,6 +211,7 @@ async def handle_compliance_check_completed(store, cmd: ComplianceCheckCompleted
             f"loan-{cmd.application_id}",
             [decline],
             expected_version=app.version,
+            **_trace_kwargs(cmd),
         )
 
     decision_requested = DecisionRequested(
@@ -205,6 +224,7 @@ async def handle_compliance_check_completed(store, cmd: ComplianceCheckCompleted
         f"loan-{cmd.application_id}",
         [decision_requested],
         expected_version=app.version,
+        **_trace_kwargs(cmd),
     )
 
 
@@ -246,6 +266,8 @@ async def handle_decision_generated(store, cmd: DecisionGeneratedCommand) -> lis
         f"loan-{cmd.application_id}",
         events,
         expected_version=app.version,
+        **_trace_kwargs(cmd),
+        **_trace_kwargs(cmd),
     )
 
 

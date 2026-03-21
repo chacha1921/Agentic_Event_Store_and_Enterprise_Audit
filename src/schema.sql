@@ -30,8 +30,12 @@ CREATE TABLE IF NOT EXISTS event_streams (
     aggregate_type TEXT NOT NULL,
     current_version BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    archived_at TIMESTAMPTZ,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 );
+
+ALTER TABLE event_streams
+    ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_event_streams_aggregate_type
     ON event_streams (aggregate_type);

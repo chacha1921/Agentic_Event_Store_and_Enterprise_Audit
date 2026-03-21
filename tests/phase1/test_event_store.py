@@ -124,6 +124,35 @@ async def test_append_multiple_events_in_one_call():
     assert await store.stream_version("s") == 2
 
 
+@pytest.mark.asyncio
+async def test_stream_metadata_and_archive_are_supported():
+    store = InMemoryEventStore()
+    stream_id = "loan-APEX-ARCH-001"
+
+    await store.append(
+        stream_id,
+        [_ev("ApplicationSubmitted", application_id="APEX-ARCH-001")],
+        expected_version=-1,
+        metadata={"application_id": "APEX-ARCH-001", "category": "loan"},
+    )
+
+    metadata = await store.get_stream_metadata(stream_id)
+    assert metadata is not None
+    assert metadata["aggregate_type"] == "loan"
+    assert metadata["current_version"] == 0
+    assert metadata["metadata"]["application_id"] == "APEX-ARCH-001"
+    assert metadata["archived_at"] is None
+
+    await store.archive_stream(stream_id)
+
+    archived = await store.get_stream_metadata(stream_id)
+    assert archived is not None
+    assert archived["archived_at"] is not None
+
+    with pytest.raises(RuntimeError):
+        await store.append(stream_id, [_ev("ShouldFail")], expected_version=0)
+
+
 # ─── EVENT SCHEMA CONFORMANCE ─────────────────────────────────────────────────
 
 @pytest.mark.asyncio

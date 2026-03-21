@@ -188,6 +188,12 @@ class LoanApplicationAggregate:
     def mark_package_ready(self) -> None:
         self.package_ready = True
 
+    async def assert_credit_analysis_completion_ready(self, store) -> None:
+        package_events = await store.load_stream(f"docpkg-{self.application_id}")
+        if any(event.get("event_type") == "PackageReadyForAnalysis" for event in package_events):
+            self.mark_package_ready()
+        self.assert_awaiting_credit_analysis()
+
     def mark_compliance_completed(self, has_hard_block: bool) -> None:
         self.compliance_completed = True
         self.compliance_hard_block = has_hard_block

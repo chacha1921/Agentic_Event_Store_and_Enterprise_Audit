@@ -59,6 +59,9 @@ class EventStore:
         schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
         async with self._pool.acquire() as conn:
             await conn.execute(schema_sql)
+            await conn.execute(
+                "ALTER TABLE event_streams ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ"
+            )
 
     def _require_pool(self) -> asyncpg.Pool:
         if self._pool is None:
@@ -127,21 +130,24 @@ class EventStore:
                 )
 
                 stream_row = await conn.fetchrow(
-                    "SELECT current_version FROM event_streams WHERE stream_id = $1",
+                    "SELECT current_version, archived_at FROM event_streams WHERE stream_id = $1",
                     stream_id,
                 )
                 current_version = stream_row["current_version"] if stream_row else -1
                 if current_version != expected_version:
                     raise OptimisticConcurrencyError(stream_id, expected_version, current_version)
+                if stream_row and stream_row["archived_at"] is not None:
+                    raise RuntimeError(f"Cannot append to archived stream '{stream_id}'")
 
                 if stream_row is None:
                     await conn.execute(
                         """
-                        INSERT INTO event_streams(stream_id, aggregate_type, current_version)
-                        VALUES($1, $2, 0)
+                        INSERT INTO event_streams(stream_id, aggregate_type, current_version, metadata)
+                        VALUES($1, $2, 0, $3::jsonb)
                         """,
                         stream_id,
                         self._aggregate_type_for(stream_id),
+                        json.dumps(metadata or {}),
                     )
 
                 next_position = 1 if current_version == -1 else current_version + 1
@@ -199,11 +205,24 @@ class EventStore:
                     assigned_positions.append(stream_position)
 
                 new_version = assigned_positions[-1]
-                await conn.execute(
-                    "UPDATE event_streams SET current_version = $1 WHERE stream_id = $2",
-                    new_version,
-                    stream_id,
-                )
+                if metadata:
+                    await conn.execute(
+                        """
+                        UPDATE event_streams
+                        SET current_version = $1,
+                            metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb
+                        WHERE stream_id = $3
+                        """,
+                        new_version,
+                        json.dumps(metadata),
+                        stream_id,
+                    )
+                else:
+                    await conn.execute(
+                        "UPDATE event_streams SET current_version = $1 WHERE stream_id = $2",
+                        new_version,
+                        stream_id,
+                    )
                 return assigned_positions
 
     async def load_stream(
@@ -311,6 +330,47 @@ class EventStore:
             )
             return self._deserialize_event(row) if row else None
 
+    async def get_stream_metadata(self, stream_id: str) -> dict | None:
+        """Return stream lifecycle metadata, or None if the stream does not exist."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    stream_id,
+                    aggregate_type,
+                    current_version,
+                    created_at,
+                    archived_at,
+                    metadata
+                FROM event_streams
+                WHERE stream_id = $1
+                """,
+                stream_id,
+            )
+            if row is None:
+                return None
+            stream_metadata = dict(row)
+            stream_metadata["metadata"] = dict(stream_metadata.get("metadata") or {})
+            return stream_metadata
+
+    async def archive_stream(self, stream_id: str, archived_at: datetime | None = None) -> None:
+        """Mark a stream as archived so no further writes can occur."""
+        pool = self._require_pool()
+        archived_timestamp = archived_at or datetime.now(timezone.utc)
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE event_streams
+                SET archived_at = COALESCE(archived_at, $2)
+                WHERE stream_id = $1
+                """,
+                stream_id,
+                archived_timestamp,
+            )
+            if result.endswith("0"):
+                raise ValueError(f"Stream '{stream_id}' does not exist")
+
     async def save_checkpoint(self, projection_name: str, position: int) -> None:
         """Persist a projection cursor on the read-model side of CQRS."""
         pool = self._require_pool()
@@ -376,6 +436,7 @@ class InMemoryEventStore:
     def __init__(self, upcaster_registry=None):
         self.upcasters = upcaster_registry
         self._streams: dict[str, list[dict]] = defaultdict(list)
+        self._stream_metadata: dict[str, dict] = {}
         self._versions: dict[str, int] = {}
         self._global: list[dict] = []
         self._checkpoints: dict[str, int] = {}
@@ -397,12 +458,30 @@ class InMemoryEventStore:
             current = self._versions.get(stream_id, -1)
             if current != expected_version:
                 raise OptimisticConcurrencyError(stream_id, expected_version, current)
+            stream_metadata = self._stream_metadata.get(stream_id)
+            if stream_metadata and stream_metadata.get("archived_at") is not None:
+                raise RuntimeError(f"Cannot append to archived stream '{stream_id}'")
 
             base_metadata = dict(metadata or {})
             if correlation_id is not None:
                 base_metadata["correlation_id"] = correlation_id
             if causation_id is not None:
                 base_metadata["causation_id"] = causation_id
+
+            if stream_id not in self._stream_metadata:
+                self._stream_metadata[stream_id] = {
+                    "stream_id": stream_id,
+                    "aggregate_type": EventStore._aggregate_type_for(stream_id),
+                    "current_version": current,
+                    "created_at": datetime.now(timezone.utc),
+                    "archived_at": None,
+                    "metadata": dict(metadata or {}),
+                }
+            elif metadata:
+                self._stream_metadata[stream_id]["metadata"] = {
+                    **self._stream_metadata[stream_id].get("metadata", {}),
+                    **dict(metadata),
+                }
 
             assigned_positions: list[int] = []
             for offset, event in enumerate(events):
@@ -423,6 +502,7 @@ class InMemoryEventStore:
                 assigned_positions.append(stream_position)
 
             self._versions[stream_id] = current + len(events)
+            self._stream_metadata[stream_id]["current_version"] = self._versions[stream_id]
             return assigned_positions
 
     async def load_stream(
@@ -453,6 +533,21 @@ class InMemoryEventStore:
             if event["event_id"] == str(event_id):
                 return dict(event)
         return None
+
+    async def get_stream_metadata(self, stream_id: str) -> dict | None:
+        metadata = self._stream_metadata.get(stream_id)
+        if metadata is None:
+            return None
+        return {
+            **metadata,
+            "metadata": dict(metadata.get("metadata") or {}),
+        }
+
+    async def archive_stream(self, stream_id: str, archived_at: datetime | None = None) -> None:
+        metadata = self._stream_metadata.get(stream_id)
+        if metadata is None:
+            raise ValueError(f"Stream '{stream_id}' does not exist")
+        metadata["archived_at"] = archived_at or datetime.now(timezone.utc)
 
     async def save_checkpoint(self, projection_name: str, position: int) -> None:
         self._checkpoints[projection_name] = position

@@ -29,6 +29,7 @@ from ledger.domain.errors import DomainError
 from ledger.event_store import InMemoryEventStore
 from ledger.schema.events import (
     AgentType,
+    AgentSessionStarted,
     ApplicationApproved,
     ApplicationSubmitted,
     CreditAnalysisCompleted,
@@ -283,3 +284,59 @@ async def test_handle_credit_analysis_completed_writes_fraud_screening_requested
     assert positions == [2]
     assert events[-1]["event_type"] == "FraudScreeningRequested"
     assert events[-1]["payload"]["triggered_by_event_id"] == "credit-complete-001"
+
+
+@pytest.mark.asyncio
+async def test_handle_credit_analysis_completed_validates_agent_session_and_tracing(store: InMemoryEventStore):
+    application_id = "APEX-CMD-TRACE-001"
+    session_id = "sess-credit-trace-001"
+    await store.append(f"loan-{application_id}", [_submitted_event(application_id)], expected_version=-1)
+    await _append(store, f"loan-{application_id}", _credit_requested_event(application_id))
+    await store.append(
+        f"docpkg-{application_id}",
+        [
+            PackageReadyForAnalysis(
+                package_id=application_id,
+                application_id=application_id,
+                documents_processed=3,
+                has_quality_flags=False,
+                quality_flag_count=0,
+                ready_at=datetime.now(),
+            ).to_store_dict()
+        ],
+        expected_version=-1,
+    )
+    await store.append(
+        f"agent-{AgentType.CREDIT_ANALYSIS.value}-{session_id}",
+        [
+            AgentSessionStarted(
+                session_id=session_id,
+                agent_type=AgentType.CREDIT_ANALYSIS,
+                agent_id="credit-agent-1",
+                application_id=application_id,
+                model_version="claude-sonnet-4-20250514",
+                langgraph_graph_version="graph-v1",
+                context_source="loan-stream",
+                context_token_count=256,
+                started_at=datetime.now(),
+            ).to_store_dict()
+        ],
+        expected_version=-1,
+    )
+
+    cmd = CreditAnalysisCompletedCommand(
+        application_id=application_id,
+        triggered_by_event_id="credit-complete-trace-001",
+        requested_at=datetime.now(),
+        session_id=session_id,
+        model_version="claude-sonnet-4-20250514",
+        correlation_id="corr-001",
+        causation_id="cause-001",
+    )
+
+    await handle_credit_analysis_completed(store, cmd)
+    events = await store.load_stream(f"loan-{application_id}")
+
+    assert events[-1]["event_type"] == "FraudScreeningRequested"
+    assert events[-1]["metadata"]["correlation_id"] == "corr-001"
+    assert events[-1]["metadata"]["causation_id"] == "cause-001"

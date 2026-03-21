@@ -1,38 +1,44 @@
 """
 ledger/event_store.py — PostgreSQL-backed EventStore
-=====================================================
-COMPLETION CHECKLIST (implement in order):
-  [ ] Phase 1, Day 1: append() + stream_version()
-  [ ] Phase 1, Day 1: load_stream()
-  [ ] Phase 1, Day 2: load_all()  (needed for projection daemon)
-  [ ] Phase 1, Day 2: get_event() (needed for causation chain)
-  [ ] Phase 4:        UpcasterRegistry.upcast() integration in load_stream/load_all
+====================================================
+Phase 1 core implementation for the append-only event store.
 """
 from __future__ import annotations
+
+import asyncio
 import json
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import AsyncGenerator
-from uuid import UUID
+from uuid import UUID, uuid4
+
 import asyncpg
+
+
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "src" / "schema.sql"
 
 
 class OptimisticConcurrencyError(Exception):
     """Raised when expected_version doesn't match current stream version."""
+
     def __init__(self, stream_id: str, expected: int, actual: int):
-        self.stream_id = stream_id; self.expected = expected; self.actual = actual
+        self.stream_id = stream_id
+        self.expected = expected
+        self.actual = actual
         super().__init__(f"OCC on '{stream_id}': expected v{expected}, actual v{actual}")
 
 
 class EventStore:
     """
-    Append-only PostgreSQL event store. All agents and projections use this class.
+    Append-only PostgreSQL event store.
 
-    IMPLEMENT IN ORDER — see inline guides in each method:
-      1. stream_version()   — simplest, needed immediately
-      2. append()           — most critical; OCC correctness is the exam
-      3. load_stream()      — needed for aggregate replay
-      4. load_all()         — async generator, needed for projection daemon
-      5. get_event()        — needed for causation chain audit
+    Design notes:
+    - `events` is immutable and append-only.
+    - `event_streams.current_version` is the authoritative OCC cursor.
+    - Stream versions are 1-based for PostgreSQL streams in this starter:
+      a new stream is `-1`, first appended event gets position `1`.
+    - `global_position` is 0-based and monotonic for projection replay.
     """
 
     def __init__(self, db_url: str, upcaster_registry=None):
@@ -41,79 +47,164 @@ class EventStore:
         self._pool: asyncpg.Pool | None = None
 
     async def connect(self) -> None:
-        self._pool = await asyncpg.create_pool(self.db_url, min_size=2, max_size=10)
+        self._pool = await asyncpg.create_pool(self.db_url, min_size=1, max_size=10)
+        await self._initialize_schema()
 
     async def close(self) -> None:
-        if self._pool: await self._pool.close()
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
+
+    async def _initialize_schema(self) -> None:
+        schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
+        async with self._pool.acquire() as conn:
+            await conn.execute(schema_sql)
+
+    def _require_pool(self) -> asyncpg.Pool:
+        if self._pool is None:
+            raise RuntimeError("EventStore is not connected. Call connect() first.")
+        return self._pool
+
+    @staticmethod
+    def _aggregate_type_for(stream_id: str) -> str:
+        return stream_id.split("-", 1)[0] if "-" in stream_id else stream_id
+
+    def _deserialize_event(self, row: asyncpg.Record) -> dict:
+        event = dict(row)
+        payload = event.get("payload") or {}
+        metadata = event.get("metadata") or {}
+        event["payload"] = dict(payload)
+        event["metadata"] = dict(metadata)
+        if self.upcasters:
+            event = self.upcasters.upcast(event)
+        return event
 
     async def stream_version(self, stream_id: str) -> int:
-        """
-        Returns current version, or -1 if stream doesn't exist.
-        IMPLEMENT:
-            async with self._pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT current_version FROM event_streams WHERE stream_id = $1",
-                    stream_id)
-                return row["current_version"] if row else -1
-        """
-        raise NotImplementedError("Implement stream_version()")
+        """Return current version, or -1 if the stream does not exist."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT current_version FROM event_streams WHERE stream_id = $1",
+                stream_id,
+            )
+            return row["current_version"] if row else -1
 
     async def append(
         self,
         stream_id: str,
         events: list[dict],
-        expected_version: int,    # -1=new stream, 0+=expected current
+        expected_version: int,
+        correlation_id: str | None = None,
         causation_id: str | None = None,
         metadata: dict | None = None,
     ) -> list[int]:
         """
-        Appends events atomically with OCC. Returns list of positions assigned.
+        Append events atomically with optimistic concurrency control.
 
-        FULL IMPLEMENTATION GUIDE — copy, uncomment, and complete:
-
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                # 1. Lock stream row (prevents concurrent appends)
-                row = await conn.fetchrow(
-                    "SELECT current_version FROM event_streams "
-                    "WHERE stream_id = $1 FOR UPDATE", stream_id)
-
-                # 2. OCC check
-                current = row["current_version"] if row else -1
-                if current != expected_version:
-                    raise OptimisticConcurrencyError(stream_id, expected_version, current)
-
-                # 3. Create stream if new
-                if row is None:
-                    await conn.execute(
-                        "INSERT INTO event_streams(stream_id, aggregate_type, current_version)"
-                        " VALUES($1, $2, 0)",
-                        stream_id, stream_id.split("-")[0])
-
-                # 4. Insert each event
-                positions = []
-                meta = {**(metadata or {})}
-                if causation_id: meta["causation_id"] = causation_id
-                for i, event in enumerate(events):
-                    pos = expected_version + 1 + i
-                    await conn.execute(
-                        "INSERT INTO events(stream_id, stream_position, event_type,"
-                        " event_version, payload, metadata, recorded_at)"
-                        " VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)",
-                        stream_id, pos,
-                        event["event_type"], event["event_version"],
-                        json.dumps(event["payload"]),
-                        json.dumps(meta),
-                        datetime.utcnow())
-                    positions.append(pos)
-
-                # 5. Update stream version
-                await conn.execute(
-                    "UPDATE event_streams SET current_version=$1 WHERE stream_id=$2",
-                    expected_version + len(events), stream_id)
-                return positions
+        How it works:
+        1. Acquire a transaction-scoped advisory lock for the stream.
+        2. Read the stream's current version inside the same transaction.
+        3. Compare it to `expected_version`; on mismatch raise OCC.
+        4. Insert immutable event rows into `events`.
+        5. Insert matching outbox rows for downstream delivery.
+        6. Advance the stream cursor in `event_streams`.
         """
-        raise NotImplementedError("Implement append()")
+        if not events:
+            return []
+
+        pool = self._require_pool()
+        base_metadata = dict(metadata or {})
+        if correlation_id is not None:
+            base_metadata["correlation_id"] = correlation_id
+        if causation_id is not None:
+            base_metadata["causation_id"] = causation_id
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    stream_id,
+                )
+
+                stream_row = await conn.fetchrow(
+                    "SELECT current_version FROM event_streams WHERE stream_id = $1",
+                    stream_id,
+                )
+                current_version = stream_row["current_version"] if stream_row else -1
+                if current_version != expected_version:
+                    raise OptimisticConcurrencyError(stream_id, expected_version, current_version)
+
+                if stream_row is None:
+                    await conn.execute(
+                        """
+                        INSERT INTO event_streams(stream_id, aggregate_type, current_version)
+                        VALUES($1, $2, 0)
+                        """,
+                        stream_id,
+                        self._aggregate_type_for(stream_id),
+                    )
+
+                next_position = 1 if current_version == -1 else current_version + 1
+                assigned_positions: list[int] = []
+
+                for offset, event in enumerate(events):
+                    stream_position = next_position + offset
+                    event_payload = dict(event.get("payload") or {})
+                    event_metadata = {**base_metadata, **dict(event.get("metadata") or {})}
+                    event_version = int(event.get("event_version", 1))
+
+                    inserted = await conn.fetchrow(
+                        """
+                        INSERT INTO events(
+                            stream_id,
+                            stream_position,
+                            event_type,
+                            event_version,
+                            payload,
+                            metadata,
+                            recorded_at
+                        )
+                        VALUES($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7)
+                        RETURNING event_id, global_position, recorded_at
+                        """,
+                        stream_id,
+                        stream_position,
+                        event["event_type"],
+                        event_version,
+                        json.dumps(event_payload),
+                        json.dumps(event_metadata),
+                        datetime.now(timezone.utc),
+                    )
+
+                    outbox_payload = {
+                        "event_id": str(inserted["event_id"]),
+                        "stream_id": stream_id,
+                        "stream_position": stream_position,
+                        "global_position": inserted["global_position"],
+                        "event_type": event["event_type"],
+                        "event_version": event_version,
+                        "payload": event_payload,
+                        "metadata": event_metadata,
+                        "recorded_at": inserted["recorded_at"].isoformat(),
+                    }
+                    await conn.execute(
+                        """
+                        INSERT INTO outbox(event_id, destination, payload)
+                        VALUES($1, $2, $3::jsonb)
+                        """,
+                        inserted["event_id"],
+                        "event_bus",
+                        json.dumps(outbox_payload),
+                    )
+                    assigned_positions.append(stream_position)
+
+                new_version = assigned_positions[-1]
+                await conn.execute(
+                    "UPDATE event_streams SET current_version = $1 WHERE stream_id = $2",
+                    new_version,
+                    stream_id,
+                )
+                return assigned_positions
 
     async def load_stream(
         self,
@@ -122,98 +213,134 @@ class EventStore:
         to_position: int | None = None,
     ) -> list[dict]:
         """
-        Loads events from a stream in stream_position order.
-        Applies upcasters if self.upcasters is set.
+        Load a single stream in stream-position order.
 
-        IMPLEMENT:
-            async with self._pool.acquire() as conn:
-                q = ("SELECT event_id, stream_id, stream_position, event_type,"
-                     " event_version, payload, metadata, recorded_at"
-                     " FROM events WHERE stream_id=$1 AND stream_position>=$2")
-                params = [stream_id, from_position]
-                if to_position is not None:
-                    q += " AND stream_position<=$3"; params.append(to_position)
-                q += " ORDER BY stream_position ASC"
-                rows = await conn.fetch(q, *params)
-                events = []
-                for row in rows:
-                    e = {**dict(row), "payload": dict(row["payload"]),
-                                       "metadata": dict(row["metadata"])}
-                    if self.upcasters: e = self.upcasters.upcast(e)
-                    events.append(e)
-                return events
+        `from_position` and `to_position` are inclusive bounds so callers can
+        replay either the whole stream or a deterministic slice.
         """
-        raise NotImplementedError("Implement load_stream()")
+        pool = self._require_pool()
+        query = """
+            SELECT
+                event_id,
+                global_position,
+                stream_id,
+                stream_position,
+                event_type,
+                event_version,
+                payload,
+                metadata,
+                recorded_at
+            FROM events
+            WHERE stream_id = $1 AND stream_position >= $2
+        """
+        params: list[object] = [stream_id, from_position]
+        if to_position is not None:
+            query += " AND stream_position <= $3"
+            params.append(to_position)
+        query += " ORDER BY stream_position ASC"
+
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query, *params)
+            return [self._deserialize_event(row) for row in rows]
 
     async def load_all(
-        self, from_position: int = 0, batch_size: int = 500
+        self,
+        from_position: int = 0,
+        batch_size: int = 500,
     ) -> AsyncGenerator[dict, None]:
         """
-        Async generator yielding all events by global_position.
-        Used by the ProjectionDaemon.
+        Yield all events globally ordered by `global_position`.
 
-        IMPLEMENT:
-            async with self._pool.acquire() as conn:
-                pos = from_position
-                while True:
-                    rows = await conn.fetch(
-                        "SELECT global_position, stream_id, stream_position,"
-                        " event_type, event_version, payload, metadata, recorded_at"
-                        " FROM events WHERE global_position > $1"
-                        " ORDER BY global_position ASC LIMIT $2",
-                        pos, batch_size)
-                    if not rows: break
-                    for row in rows:
-                        e = {**dict(row), "payload": dict(row["payload"]),
-                                           "metadata": dict(row["metadata"])}
-                        yield e
-                    pos = rows[-1]["global_position"]
-                    if len(rows) < batch_size: break
+        This is the replay primitive projections use to catch up from a saved
+        checkpoint without touching the write model.
         """
-        raise NotImplementedError("Implement load_all()")
-        if False: yield {}  # makes Python treat this as a generator
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            current_position = from_position
+            while True:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        event_id,
+                        global_position,
+                        stream_id,
+                        stream_position,
+                        event_type,
+                        event_version,
+                        payload,
+                        metadata,
+                        recorded_at
+                    FROM events
+                    WHERE global_position >= $1
+                    ORDER BY global_position ASC
+                    LIMIT $2
+                    """,
+                    current_position,
+                    batch_size,
+                )
+                if not rows:
+                    break
 
-    async def get_event(self, event_id: UUID) -> dict | None:
-        """
-        Loads one event by UUID. Used for causation chain lookups.
+                for row in rows:
+                    yield self._deserialize_event(row)
 
-        IMPLEMENT:
-            async with self._pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT * FROM events WHERE event_id=$1", event_id)
-                if not row: return None
-                return {**dict(row), "payload": dict(row["payload"]),
-                                      "metadata": dict(row["metadata"])}
-        """
-        raise NotImplementedError("Implement get_event()")
+                current_position = rows[-1]["global_position"] + 1
+                if len(rows) < batch_size:
+                    break
 
+    async def get_event(self, event_id: UUID | str) -> dict | None:
+        """Load a single event by id."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    event_id,
+                    global_position,
+                    stream_id,
+                    stream_position,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata,
+                    recorded_at
+                FROM events
+                WHERE event_id = $1
+                """,
+                event_id,
+            )
+            return self._deserialize_event(row) if row else None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UPCASTER REGISTRY — Phase 4
-# ─────────────────────────────────────────────────────────────────────────────
+    async def save_checkpoint(self, projection_name: str, position: int) -> None:
+        """Persist a projection cursor on the read-model side of CQRS."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO projection_checkpoints(projection_name, last_position)
+                VALUES($1, $2)
+                ON CONFLICT (projection_name)
+                DO UPDATE SET
+                    last_position = EXCLUDED.last_position,
+                    updated_at = NOW()
+                """,
+                projection_name,
+                position,
+            )
+
+    async def load_checkpoint(self, projection_name: str) -> int:
+        """Return the last saved projection cursor, defaulting to 0."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT last_position FROM projection_checkpoints WHERE projection_name = $1",
+                projection_name,
+            )
+            return row["last_position"] if row else 0
+
 
 class UpcasterRegistry:
-    """
-    Transforms old event versions to current versions on load.
-    Upcasters are PURE functions — they never write to the database.
-
-    REGISTER AN UPCASTER:
-        registry = UpcasterRegistry()
-
-        @registry.upcaster("CreditAnalysisCompleted", from_version=1, to_version=2)
-        def upcast_credit_v1_v2(payload: dict) -> dict:
-            # v2 adds model_versions dict
-            payload.setdefault("model_versions", {})
-            return payload
-
-    REQUIRED FOR PHASE 4:
-        - CreditAnalysisCompleted  v1 → v2  (adds model_versions: dict)
-        - DecisionGenerated        v1 → v2  (adds model_versions: dict)
-
-    IMMUTABILITY TEST (required artifact):
-        registry.assert_upcaster_does_not_write_to_db(store, event)
-        # Loads the event, upcasts it, re-loads it, confirms DB row unchanged.
-    """
+    """Transforms old event versions to the current shape when events are read."""
 
     def __init__(self):
         self._upcasters: dict[str, dict[int, callable]] = {}
@@ -222,130 +349,37 @@ class UpcasterRegistry:
         def decorator(fn):
             self._upcasters.setdefault(event_type, {})[from_version] = fn
             return fn
+
         return decorator
 
     def upcast(self, event: dict) -> dict:
-        """Apply chain of upcasters until latest version reached."""
-        et = event["event_type"]
-        v = event.get("event_version", 1)
-        chain = self._upcasters.get(et, {})
-        while v in chain:
-            event["payload"] = chain[v](dict(event["payload"]))
-            v += 1
-            event["event_version"] = v
-        return event
+        event_type = event["event_type"]
+        version = event.get("event_version", 1)
+        chain = self._upcasters.get(event_type, {})
+        current = dict(event)
+        while version in chain:
+            current["payload"] = chain[version](dict(current["payload"]))
+            version += 1
+            current["event_version"] = version
+        return current
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# IN-MEMORY EVENT STORE — for tests only
-# ─────────────────────────────────────────────────────────────────────────────
 
 class InMemoryEventStore:
     """
-    In-memory event store for unit tests. No database required.
-    Identical interface to EventStore — swap transparently in conftest.py.
+    Asyncio-safe in-memory store for unit tests.
 
-    Your Phase 1 tests use this. Once EventStore is implemented and a test
-    database is available, you can run all tests against the real store too.
+    This one keeps the repo's Phase 1 test semantics:
+    stream positions are 0-based in memory, while the PostgreSQL store above is
+    1-based to match the integration test expectations and stream cursor table.
     """
 
     def __init__(self, upcaster_registry=None):
         self.upcasters = upcaster_registry
-        self._streams: dict[str, list[dict]] = {}   # stream_id → [event_dict, ...]
-        self._global: list[dict] = []               # all events in global order
-
-    async def stream_version(self, stream_id: str) -> int:
-        events = self._streams.get(stream_id, [])
-        return len(events) - 1  # -1 if empty, 0-based index otherwise
-
-    async def append(
-        self,
-        stream_id: str,
-        events: list[dict],
-        expected_version: int,
-        causation_id: str | None = None,
-        metadata: dict | None = None,
-    ) -> list[int]:
-        current = await self.stream_version(stream_id)
-        if current != expected_version:
-            raise OptimisticConcurrencyError(stream_id, expected_version, current)
-
-        self._streams.setdefault(stream_id, [])
-        positions = []
-        for i, event in enumerate(events):
-            pos = expected_version + 1 + i
-            stored = {
-                "event_id": str(__import__("uuid").uuid4()),
-                "stream_id": stream_id,
-                "stream_position": pos,
-                "global_position": len(self._global),
-                "event_type": event["event_type"],
-                "event_version": event.get("event_version", 1),
-                "payload": dict(event.get("payload", {})),
-                "metadata": {**(metadata or {}), **({"causation_id": causation_id} if causation_id else {})},
-                "recorded_at": __import__("datetime").datetime.utcnow(),
-            }
-            self._streams[stream_id].append(stored)
-            self._global.append(stored)
-            positions.append(pos)
-        return positions
-
-    async def load_stream(
-        self,
-        stream_id: str,
-        from_position: int = 0,
-        to_position: int | None = None,
-    ) -> list[dict]:
-        events = self._streams.get(stream_id, [])
-        result = [e for e in events if e["stream_position"] >= from_position]
-        if to_position is not None:
-            result = [e for e in result if e["stream_position"] <= to_position]
-        if self.upcasters:
-            result = [self.upcasters.upcast(dict(e)) for e in result]
-        return result
-
-    async def load_all(
-        self, from_position: int = 0, batch_size: int = 500
-    ):
-        for event in self._global:
-            if event["global_position"] >= from_position:
-                yield dict(event)
-
-    async def get_event(self, event_id) -> dict | None:
-        for event in self._global:
-            if event["event_id"] == str(event_id):
-                return dict(event)
-        return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# IN-MEMORY EVENT STORE — for Phase 1 tests only
-# Identical interface to EventStore. Drop-in for tests; never use in production.
-# ─────────────────────────────────────────────────────────────────────────────
-
-import asyncio as _asyncio
-from collections import defaultdict as _defaultdict
-from datetime import datetime as _datetime
-from uuid import uuid4 as _uuid4
-
-class InMemoryEventStore:
-    """
-    Thread-safe (asyncio-safe) in-memory event store.
-    Used exclusively in Phase 1 tests and conftest fixtures.
-    Same interface as EventStore — swap one for the other with no code changes.
-    """
-
-    def __init__(self):
-        # stream_id -> list of event dicts
-        self._streams: dict[str, list[dict]] = _defaultdict(list)
-        # stream_id -> current version (position of last event, -1 if empty)
+        self._streams: dict[str, list[dict]] = defaultdict(list)
         self._versions: dict[str, int] = {}
-        # global append log (ordered by insertion)
         self._global: list[dict] = []
-        # projection checkpoints
         self._checkpoints: dict[str, int] = {}
-        # asyncio lock per stream for OCC
-        self._locks: dict[str, _asyncio.Lock] = _defaultdict(_asyncio.Lock)
+        self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     async def stream_version(self, stream_id: str) -> int:
         return self._versions.get(stream_id, -1)
@@ -355,6 +389,7 @@ class InMemoryEventStore:
         stream_id: str,
         events: list[dict],
         expected_version: int,
+        correlation_id: str | None = None,
         causation_id: str | None = None,
         metadata: dict | None = None,
     ) -> list[int]:
@@ -363,30 +398,32 @@ class InMemoryEventStore:
             if current != expected_version:
                 raise OptimisticConcurrencyError(stream_id, expected_version, current)
 
-            positions = []
-            meta = {**(metadata or {})}
-            if causation_id:
-                meta["causation_id"] = causation_id
+            base_metadata = dict(metadata or {})
+            if correlation_id is not None:
+                base_metadata["correlation_id"] = correlation_id
+            if causation_id is not None:
+                base_metadata["causation_id"] = causation_id
 
-            for i, event in enumerate(events):
-                pos = current + 1 + i
+            assigned_positions: list[int] = []
+            for offset, event in enumerate(events):
+                stream_position = current + 1 + offset
                 stored = {
-                    "event_id": str(_uuid4()),
+                    "event_id": str(uuid4()),
                     "stream_id": stream_id,
-                    "stream_position": pos,
+                    "stream_position": stream_position,
                     "global_position": len(self._global),
                     "event_type": event["event_type"],
                     "event_version": event.get("event_version", 1),
-                    "payload": dict(event.get("payload", {})),
-                    "metadata": meta,
-                    "recorded_at": _datetime.utcnow().isoformat(),
+                    "payload": dict(event.get("payload") or {}),
+                    "metadata": {**base_metadata, **dict(event.get("metadata") or {})},
+                    "recorded_at": datetime.now(timezone.utc),
                 }
                 self._streams[stream_id].append(stored)
                 self._global.append(stored)
-                positions.append(pos)
+                assigned_positions.append(stream_position)
 
             self._versions[stream_id] = current + len(events)
-            return positions
+            return assigned_positions
 
     async def load_stream(
         self,
@@ -395,21 +432,26 @@ class InMemoryEventStore:
         to_position: int | None = None,
     ) -> list[dict]:
         events = [
-            e for e in self._streams.get(stream_id, [])
-            if e["stream_position"] >= from_position
-            and (to_position is None or e["stream_position"] <= to_position)
+            dict(event)
+            for event in self._streams.get(stream_id, [])
+            if event["stream_position"] >= from_position
+            and (to_position is None or event["stream_position"] <= to_position)
         ]
-        return sorted(events, key=lambda e: e["stream_position"])
+        events.sort(key=lambda event: event["stream_position"])
+        if self.upcasters:
+            return [self.upcasters.upcast(event) for event in events]
+        return events
 
     async def load_all(self, from_position: int = 0, batch_size: int = 500):
-        for e in self._global:
-            if e["global_position"] >= from_position:
-                yield e
+        del batch_size
+        for event in self._global:
+            if event["global_position"] >= from_position:
+                yield dict(event)
 
-    async def get_event(self, event_id: str) -> dict | None:
-        for e in self._global:
-            if e["event_id"] == event_id:
-                return e
+    async def get_event(self, event_id: UUID | str) -> dict | None:
+        for event in self._global:
+            if event["event_id"] == str(event_id):
+                return dict(event)
         return None
 
     async def save_checkpoint(self, projection_name: str, position: int) -> None:

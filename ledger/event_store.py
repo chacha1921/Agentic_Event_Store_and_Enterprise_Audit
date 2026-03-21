@@ -8,12 +8,14 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, Iterator
 from uuid import UUID, uuid4
 
 import asyncpg
+from pydantic import BaseModel, ConfigDict, Field
 
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "src" / "schema.sql"
@@ -27,6 +29,66 @@ class OptimisticConcurrencyError(Exception):
         self.expected = expected
         self.actual = actual
         super().__init__(f"OCC on '{stream_id}': expected v{expected}, actual v{actual}")
+
+
+class StorageModel(BaseModel, Mapping[str, Any]):
+    """Immutable, mapping-compatible base for storage-layer models."""
+
+    model_config = ConfigDict(frozen=True)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.model_dump(mode="python"))
+
+    def __len__(self) -> int:
+        return len(self.model_dump(mode="python"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.model_dump(mode="python")
+
+
+class StoredEvent(StorageModel):
+    """Storage envelope for a persisted domain event."""
+
+    event_id: str
+    stream_id: str
+    stream_position: int
+    global_position: int
+    event_type: str
+    event_version: int = 1
+    payload: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    recorded_at: datetime
+
+    @property
+    def envelope(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "stream_id": self.stream_id,
+            "stream_position": self.stream_position,
+            "global_position": self.global_position,
+            "event_type": self.event_type,
+            "event_version": self.event_version,
+            "metadata": dict(self.metadata),
+            "recorded_at": self.recorded_at,
+        }
+
+    @property
+    def domain_data(self) -> dict[str, Any]:
+        return dict(self.payload)
+
+
+class StreamMetadata(StorageModel):
+    """Storage metadata for an aggregate stream lifecycle."""
+
+    stream_id: str
+    aggregate_type: str
+    current_version: int
+    created_at: datetime
+    archived_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class EventStore:
@@ -72,15 +134,20 @@ class EventStore:
     def _aggregate_type_for(stream_id: str) -> str:
         return stream_id.split("-", 1)[0] if "-" in stream_id else stream_id
 
-    def _deserialize_event(self, row: asyncpg.Record) -> dict:
+    def _deserialize_event(self, row: asyncpg.Record) -> StoredEvent:
         event = dict(row)
-        payload = event.get("payload") or {}
-        metadata = event.get("metadata") or {}
-        event["payload"] = dict(payload)
-        event["metadata"] = dict(metadata)
+        event["event_id"] = str(event["event_id"])
+        event["payload"] = dict(event.get("payload") or {})
+        event["metadata"] = dict(event.get("metadata") or {})
         if self.upcasters:
             event = self.upcasters.upcast(event)
-        return event
+        return StoredEvent.model_validate(event)
+
+    @staticmethod
+    def _deserialize_stream_metadata(row: asyncpg.Record) -> StreamMetadata:
+        stream_metadata = dict(row)
+        stream_metadata["metadata"] = dict(stream_metadata.get("metadata") or {})
+        return StreamMetadata.model_validate(stream_metadata)
 
     async def stream_version(self, stream_id: str) -> int:
         """Return current version, or -1 if the stream does not exist."""
@@ -230,7 +297,7 @@ class EventStore:
         stream_id: str,
         from_position: int = 0,
         to_position: int | None = None,
-    ) -> list[dict]:
+    ) -> list[StoredEvent]:
         """
         Load a single stream in stream-position order.
 
@@ -266,7 +333,7 @@ class EventStore:
         self,
         from_position: int = 0,
         batch_size: int = 500,
-    ) -> AsyncGenerator[dict, None]:
+    ) -> AsyncGenerator[StoredEvent, None]:
         """
         Yield all events globally ordered by `global_position`.
 
@@ -307,7 +374,7 @@ class EventStore:
                 if len(rows) < batch_size:
                     break
 
-    async def get_event(self, event_id: UUID | str) -> dict | None:
+    async def get_event(self, event_id: UUID | str) -> StoredEvent | None:
         """Load a single event by id."""
         pool = self._require_pool()
         async with pool.acquire() as conn:
@@ -330,7 +397,7 @@ class EventStore:
             )
             return self._deserialize_event(row) if row else None
 
-    async def get_stream_metadata(self, stream_id: str) -> dict | None:
+    async def get_stream_metadata(self, stream_id: str) -> StreamMetadata | None:
         """Return stream lifecycle metadata, or None if the stream does not exist."""
         pool = self._require_pool()
         async with pool.acquire() as conn:
@@ -350,9 +417,7 @@ class EventStore:
             )
             if row is None:
                 return None
-            stream_metadata = dict(row)
-            stream_metadata["metadata"] = dict(stream_metadata.get("metadata") or {})
-            return stream_metadata
+            return self._deserialize_stream_metadata(row)
 
     async def archive_stream(self, stream_id: str, archived_at: datetime | None = None) -> None:
         """Mark a stream as archived so no further writes can occur."""
@@ -435,10 +500,10 @@ class InMemoryEventStore:
 
     def __init__(self, upcaster_registry=None):
         self.upcasters = upcaster_registry
-        self._streams: dict[str, list[dict]] = defaultdict(list)
-        self._stream_metadata: dict[str, dict] = {}
+        self._streams: dict[str, list[StoredEvent]] = defaultdict(list)
+        self._stream_metadata: dict[str, StreamMetadata] = {}
         self._versions: dict[str, int] = {}
-        self._global: list[dict] = []
+        self._global: list[StoredEvent] = []
         self._checkpoints: dict[str, int] = {}
         self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -469,40 +534,47 @@ class InMemoryEventStore:
                 base_metadata["causation_id"] = causation_id
 
             if stream_id not in self._stream_metadata:
-                self._stream_metadata[stream_id] = {
-                    "stream_id": stream_id,
-                    "aggregate_type": EventStore._aggregate_type_for(stream_id),
-                    "current_version": current,
-                    "created_at": datetime.now(timezone.utc),
-                    "archived_at": None,
-                    "metadata": dict(metadata or {}),
-                }
+                self._stream_metadata[stream_id] = StreamMetadata(
+                    stream_id=stream_id,
+                    aggregate_type=EventStore._aggregate_type_for(stream_id),
+                    current_version=current,
+                    created_at=datetime.now(timezone.utc),
+                    archived_at=None,
+                    metadata=dict(metadata or {}),
+                )
             elif metadata:
-                self._stream_metadata[stream_id]["metadata"] = {
-                    **self._stream_metadata[stream_id].get("metadata", {}),
-                    **dict(metadata),
-                }
+                current_metadata = self._stream_metadata[stream_id]
+                self._stream_metadata[stream_id] = current_metadata.model_copy(
+                    update={
+                        "metadata": {
+                            **current_metadata.metadata,
+                            **dict(metadata),
+                        }
+                    }
+                )
 
             assigned_positions: list[int] = []
             for offset, event in enumerate(events):
                 stream_position = current + 1 + offset
-                stored = {
-                    "event_id": str(uuid4()),
-                    "stream_id": stream_id,
-                    "stream_position": stream_position,
-                    "global_position": len(self._global),
-                    "event_type": event["event_type"],
-                    "event_version": event.get("event_version", 1),
-                    "payload": dict(event.get("payload") or {}),
-                    "metadata": {**base_metadata, **dict(event.get("metadata") or {})},
-                    "recorded_at": datetime.now(timezone.utc),
-                }
+                stored = StoredEvent(
+                    event_id=str(uuid4()),
+                    stream_id=stream_id,
+                    stream_position=stream_position,
+                    global_position=len(self._global),
+                    event_type=event["event_type"],
+                    event_version=int(event.get("event_version", 1)),
+                    payload=dict(event.get("payload") or {}),
+                    metadata={**base_metadata, **dict(event.get("metadata") or {})},
+                    recorded_at=datetime.now(timezone.utc),
+                )
                 self._streams[stream_id].append(stored)
                 self._global.append(stored)
                 assigned_positions.append(stream_position)
 
             self._versions[stream_id] = current + len(events)
-            self._stream_metadata[stream_id]["current_version"] = self._versions[stream_id]
+            self._stream_metadata[stream_id] = self._stream_metadata[stream_id].model_copy(
+                update={"current_version": self._versions[stream_id]}
+            )
             return assigned_positions
 
     async def load_stream(
@@ -510,44 +582,43 @@ class InMemoryEventStore:
         stream_id: str,
         from_position: int = 0,
         to_position: int | None = None,
-    ) -> list[dict]:
+    ) -> list[StoredEvent]:
         events = [
-            dict(event)
+            event.model_copy(deep=True)
             for event in self._streams.get(stream_id, [])
             if event["stream_position"] >= from_position
             and (to_position is None or event["stream_position"] <= to_position)
         ]
         events.sort(key=lambda event: event["stream_position"])
         if self.upcasters:
-            return [self.upcasters.upcast(event) for event in events]
+            return [StoredEvent.model_validate(self.upcasters.upcast(event.to_dict())) for event in events]
         return events
 
     async def load_all(self, from_position: int = 0, batch_size: int = 500):
         del batch_size
         for event in self._global:
             if event["global_position"] >= from_position:
-                yield dict(event)
+                yield event.model_copy(deep=True)
 
-    async def get_event(self, event_id: UUID | str) -> dict | None:
+    async def get_event(self, event_id: UUID | str) -> StoredEvent | None:
         for event in self._global:
             if event["event_id"] == str(event_id):
-                return dict(event)
+                return event.model_copy(deep=True)
         return None
 
-    async def get_stream_metadata(self, stream_id: str) -> dict | None:
+    async def get_stream_metadata(self, stream_id: str) -> StreamMetadata | None:
         metadata = self._stream_metadata.get(stream_id)
         if metadata is None:
             return None
-        return {
-            **metadata,
-            "metadata": dict(metadata.get("metadata") or {}),
-        }
+        return metadata.model_copy(deep=True)
 
     async def archive_stream(self, stream_id: str, archived_at: datetime | None = None) -> None:
         metadata = self._stream_metadata.get(stream_id)
         if metadata is None:
             raise ValueError(f"Stream '{stream_id}' does not exist")
-        metadata["archived_at"] = archived_at or datetime.now(timezone.utc)
+        self._stream_metadata[stream_id] = metadata.model_copy(
+            update={"archived_at": archived_at or datetime.now(timezone.utc)}
+        )
 
     async def save_checkpoint(self, projection_name: str, position: int) -> None:
         self._checkpoints[projection_name] = position

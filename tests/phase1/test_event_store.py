@@ -10,7 +10,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 
-from ledger.event_store import InMemoryEventStore, OptimisticConcurrencyError
+from ledger.event_store import InMemoryEventStore, OptimisticConcurrencyError, StoredEvent, StreamMetadata
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -84,6 +84,7 @@ async def test_load_stream_returns_events_in_order():
 
     events = await store.load_stream("s")
     assert len(events) == 5
+    assert isinstance(events[0], StoredEvent)
     for i, ev in enumerate(events):
         assert ev["stream_position"] == i
         assert ev["event_type"] == f"Event{i}"
@@ -138,6 +139,7 @@ async def test_stream_metadata_and_archive_are_supported():
 
     metadata = await store.get_stream_metadata(stream_id)
     assert metadata is not None
+    assert isinstance(metadata, StreamMetadata)
     assert metadata["aggregate_type"] == "loan"
     assert metadata["current_version"] == 0
     assert metadata["metadata"]["application_id"] == "APEX-ARCH-001"

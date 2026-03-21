@@ -1,85 +1,208 @@
-"""
-ledger/domain/aggregates/loan_application.py
-=============================================
-COMPLETION STATUS: STUB — implement apply() for each event, enforce business rules.
-
-The aggregate replays its event stream to rebuild state.
-Command handlers validate against current state before appending events.
-
-BUSINESS RULES TO ENFORCE:
-  1. State machine: only valid transitions allowed
-  2. DocumentFactsExtracted must exist before CreditAnalysisCompleted
-  3. All 6 compliance rules must complete before DecisionGenerated (unless hard block)
-  4. confidence < 0.60 → recommendation must be REFER (enforced here, not in LLM)
-  5. Compliance BLOCKED → only DECLINE allowed, not APPROVE or REFER
-  6. Causal chain: every agent event must reference a triggering event_id
-
-See: Section 4 of challenge document for full rule specifications.
-"""
+"""Loan application aggregate with replay-based state reconstruction."""
 from __future__ import annotations
+
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import Enum
+from typing import Any
 
-class ApplicationState(str, Enum):
-    NEW = "NEW"; SUBMITTED = "SUBMITTED"; DOCUMENTS_PENDING = "DOCUMENTS_PENDING"
-    DOCUMENTS_UPLOADED = "DOCUMENTS_UPLOADED"; DOCUMENTS_PROCESSED = "DOCUMENTS_PROCESSED"
-    CREDIT_ANALYSIS_REQUESTED = "CREDIT_ANALYSIS_REQUESTED"; CREDIT_ANALYSIS_COMPLETE = "CREDIT_ANALYSIS_COMPLETE"
-    FRAUD_SCREENING_REQUESTED = "FRAUD_SCREENING_REQUESTED"; FRAUD_SCREENING_COMPLETE = "FRAUD_SCREENING_COMPLETE"
-    COMPLIANCE_CHECK_REQUESTED = "COMPLIANCE_CHECK_REQUESTED"; COMPLIANCE_CHECK_COMPLETE = "COMPLIANCE_CHECK_COMPLETE"
-    PENDING_DECISION = "PENDING_DECISION"; PENDING_HUMAN_REVIEW = "PENDING_HUMAN_REVIEW"
-    APPROVED = "APPROVED"; DECLINED = "DECLINED"; DECLINED_COMPLIANCE = "DECLINED_COMPLIANCE"
-    REFERRED = "REFERRED"
+from ledger.domain.errors import DomainError
+from ledger.schema.events import deserialize_event
 
-VALID_TRANSITIONS = {
-    ApplicationState.NEW: [ApplicationState.SUBMITTED],
-    ApplicationState.SUBMITTED: [ApplicationState.DOCUMENTS_PENDING],
-    ApplicationState.DOCUMENTS_PENDING: [ApplicationState.DOCUMENTS_UPLOADED],
-    ApplicationState.DOCUMENTS_UPLOADED: [ApplicationState.DOCUMENTS_PROCESSED],
-    ApplicationState.DOCUMENTS_PROCESSED: [ApplicationState.CREDIT_ANALYSIS_REQUESTED],
-    ApplicationState.CREDIT_ANALYSIS_REQUESTED: [ApplicationState.CREDIT_ANALYSIS_COMPLETE],
-    ApplicationState.CREDIT_ANALYSIS_COMPLETE: [ApplicationState.FRAUD_SCREENING_REQUESTED],
-    ApplicationState.FRAUD_SCREENING_REQUESTED: [ApplicationState.FRAUD_SCREENING_COMPLETE],
-    ApplicationState.FRAUD_SCREENING_COMPLETE: [ApplicationState.COMPLIANCE_CHECK_REQUESTED],
-    ApplicationState.COMPLIANCE_CHECK_REQUESTED: [ApplicationState.COMPLIANCE_CHECK_COMPLETE],
-    ApplicationState.COMPLIANCE_CHECK_COMPLETE: [ApplicationState.PENDING_DECISION, ApplicationState.DECLINED_COMPLIANCE],
-    ApplicationState.PENDING_DECISION: [ApplicationState.APPROVED, ApplicationState.DECLINED, ApplicationState.PENDING_HUMAN_REVIEW],
-    ApplicationState.PENDING_HUMAN_REVIEW: [ApplicationState.APPROVED, ApplicationState.DECLINED],
+
+class LoanApplicationState(str, Enum):
+    SUBMITTED = "Submitted"
+    AWAITING_ANALYSIS = "AwaitingAnalysis"
+    ANALYSIS_COMPLETE = "AnalysisComplete"
+    COMPLIANCE_REVIEW = "ComplianceReview"
+    PENDING_DECISION = "PendingDecision"
+    APPROVED_PENDING_HUMAN = "ApprovedPendingHuman"
+    DECLINED_PENDING_HUMAN = "DeclinedPendingHuman"
+    FINAL_APPROVED = "FinalApproved"
+    FINAL_DECLINED = "FinalDeclined"
+
+
+VALID_TRANSITIONS: dict[LoanApplicationState | None, set[LoanApplicationState]] = {
+    None: {LoanApplicationState.SUBMITTED},
+    LoanApplicationState.SUBMITTED: {LoanApplicationState.AWAITING_ANALYSIS},
+    LoanApplicationState.AWAITING_ANALYSIS: {
+        LoanApplicationState.ANALYSIS_COMPLETE,
+        LoanApplicationState.COMPLIANCE_REVIEW,
+    },
+    LoanApplicationState.ANALYSIS_COMPLETE: {LoanApplicationState.COMPLIANCE_REVIEW},
+    LoanApplicationState.COMPLIANCE_REVIEW: {
+        LoanApplicationState.PENDING_DECISION,
+        LoanApplicationState.FINAL_DECLINED,
+    },
+    LoanApplicationState.PENDING_DECISION: {
+        LoanApplicationState.APPROVED_PENDING_HUMAN,
+        LoanApplicationState.DECLINED_PENDING_HUMAN,
+    },
+    LoanApplicationState.APPROVED_PENDING_HUMAN: {LoanApplicationState.FINAL_APPROVED, LoanApplicationState.FINAL_DECLINED},
+    LoanApplicationState.DECLINED_PENDING_HUMAN: {LoanApplicationState.FINAL_APPROVED, LoanApplicationState.FINAL_DECLINED},
 }
+
 
 @dataclass
 class LoanApplicationAggregate:
     application_id: str
-    state: ApplicationState = ApplicationState.NEW
+    version: int = -1
+    state: LoanApplicationState | None = None
     applicant_id: str | None = None
-    requested_amount_usd: float | None = None
+    requested_amount_usd: Decimal | None = None
     loan_purpose: str | None = None
-    version: int = 0
-    events: list[dict] = field(default_factory=list)
+    uploaded_documents: set[str] = field(default_factory=set)
+    documents_requested: bool = False
+    package_ready: bool = False
+    credit_requested: bool = False
+    fraud_requested: bool = False
+    compliance_requested: bool = False
+    compliance_completed: bool = False
+    compliance_hard_block: bool = False
+    decision_requested: bool = False
+    decision_generated: bool = False
+    recommendation: str | None = None
+    decision_confidence: float | None = None
+    human_review_requested: bool = False
+    human_review_completed: bool = False
+    final_decision: str | None = None
+    decline_reasons: list[str] = field(default_factory=list)
+    _events: list[dict] = field(default_factory=list)
 
     @classmethod
     async def load(cls, store, application_id: str) -> "LoanApplicationAggregate":
-        """Load and replay event stream to rebuild aggregate state."""
-        agg = cls(application_id=application_id)
-        # TODO: stream_events = await store.load_stream(f"loan-{application_id}")
-        # TODO: for event in stream_events: agg.apply(event)
-        return agg
+        aggregate = cls(application_id=application_id)
+        stream_events = await store.load_stream(f"loan-{application_id}")
+        for event in stream_events:
+            aggregate._apply(event)
+        return aggregate
 
-    def apply(self, event: dict) -> None:
-        """Apply one event to update aggregate state. TODO: implement for each event type."""
-        et = event.get("event_type"); p = event.get("payload", {})
-        self.version += 1
-        if et == "ApplicationSubmitted":
-            self.state = ApplicationState.SUBMITTED
-            self.applicant_id = p.get("applicant_id")
-            self.requested_amount_usd = p.get("requested_amount_usd")
-            self.loan_purpose = p.get("loan_purpose")
-        elif et == "DocumentUploadRequested":
-            self.state = ApplicationState.DOCUMENTS_PENDING
-        elif et == "DocumentUploaded":
-            self.state = ApplicationState.DOCUMENTS_UPLOADED
-        # TODO: implement remaining transitions
+    def _apply(self, event: dict) -> None:
+        event_type = event.get("event_type")
+        handler = getattr(self, f"_on_{event_type}", None)
+        if handler is None:
+            self.version = event.get("stream_position", self.version + 1)
+            self._events.append(event)
+            return
+        domain_event = deserialize_event(event_type, event.get("payload", {}))
+        handler(domain_event, event)
+        self.version = event.get("stream_position", self.version + 1)
+        self._events.append(event)
 
-    def assert_valid_transition(self, target: ApplicationState) -> None:
-        allowed = VALID_TRANSITIONS.get(self.state, [])
-        if target not in allowed:
-            raise ValueError(f"Invalid transition {self.state} → {target}. Allowed: {allowed}")
+    def _transition(self, target: LoanApplicationState) -> None:
+        allowed = VALID_TRANSITIONS.get(self.state, set())
+        if target != self.state and target not in allowed:
+            raise DomainError(f"Invalid transition {self.state} -> {target}")
+        self.state = target
+
+    def _ensure(self, condition: bool, message: str) -> None:
+        if not condition:
+            raise DomainError(message)
+
+    def _on_ApplicationSubmitted(self, event, _: dict) -> None:
+        self._transition(LoanApplicationState.SUBMITTED)
+        self.applicant_id = event.applicant_id
+        self.requested_amount_usd = event.requested_amount_usd
+        self.loan_purpose = str(event.loan_purpose)
+
+    def _on_DocumentUploadRequested(self, event, _: dict) -> None:
+        self._ensure(self.state == LoanApplicationState.SUBMITTED, "Document upload can only be requested after submission")
+        self.documents_requested = True
+
+    def _on_DocumentUploaded(self, event, _: dict) -> None:
+        self._ensure(self.documents_requested, "Documents cannot be uploaded before upload is requested")
+        self.uploaded_documents.add(str(event.document_type))
+
+    def _on_CreditAnalysisRequested(self, event, _: dict) -> None:
+        del event
+        self._ensure(self.state == LoanApplicationState.SUBMITTED, "Credit analysis can only start from submitted state")
+        self._transition(LoanApplicationState.AWAITING_ANALYSIS)
+        self.credit_requested = True
+
+    def _on_FraudScreeningRequested(self, event, _: dict) -> None:
+        self._ensure(self.credit_requested, "Fraud screening requires completed credit analysis")
+        self._ensure(event.triggered_by_event_id, "Fraud screening must reference a triggering event")
+        self.fraud_requested = True
+
+    def _on_ComplianceCheckRequested(self, event, _: dict) -> None:
+        self._ensure(self.fraud_requested, "Compliance review requires fraud screening to complete")
+        self._ensure(event.triggered_by_event_id, "Compliance check must reference a triggering event")
+        if self.state == LoanApplicationState.AWAITING_ANALYSIS:
+            self._transition(LoanApplicationState.ANALYSIS_COMPLETE)
+        self._transition(LoanApplicationState.COMPLIANCE_REVIEW)
+        self.compliance_requested = True
+
+    def _on_DecisionRequested(self, event, _: dict) -> None:
+        self._ensure(self.compliance_completed and not self.compliance_hard_block, "Decision cannot be requested before compliance completes cleanly")
+        self._ensure(event.triggered_by_event_id, "Decision request must reference a triggering event")
+        self._transition(LoanApplicationState.PENDING_DECISION)
+        self.decision_requested = True
+
+    def _on_DecisionGenerated(self, event, _: dict) -> None:
+        self._ensure(self.state == LoanApplicationState.PENDING_DECISION, "DecisionGenerated is only valid in PendingDecision state")
+        recommendation = event.recommendation.upper()
+        confidence = float(event.confidence)
+        if confidence < 0.60:
+            recommendation = "REFER"
+        if self.compliance_hard_block and recommendation != "DECLINE":
+            raise DomainError("Compliance hard block can only produce DECLINE")
+        self.decision_generated = True
+        self.decision_confidence = confidence
+        self.recommendation = recommendation
+        if recommendation == "APPROVE":
+            self._transition(LoanApplicationState.APPROVED_PENDING_HUMAN)
+        elif recommendation == "DECLINE":
+            self._transition(LoanApplicationState.DECLINED_PENDING_HUMAN)
+        elif recommendation == "REFER":
+            self.human_review_requested = True
+        else:
+            raise DomainError(f"Unsupported recommendation: {recommendation}")
+
+    def _on_HumanReviewRequested(self, event, _: dict) -> None:
+        self._ensure(self.decision_generated, "Human review can only be requested after a decision is generated")
+        self._ensure(event.decision_event_id, "Human review must reference a decision event")
+        self.human_review_requested = True
+
+    def _on_HumanReviewCompleted(self, event, _: dict) -> None:
+        self._ensure(self.human_review_requested or self.decision_generated, "Human review cannot complete before it is requested")
+        self.human_review_completed = True
+        self.final_decision = event.final_decision.upper()
+
+    def _on_ApplicationApproved(self, event, _: dict) -> None:
+        del event
+        self._ensure(not self.compliance_hard_block, "Application cannot be approved after compliance hard block")
+        self._ensure(self.state in {LoanApplicationState.APPROVED_PENDING_HUMAN, LoanApplicationState.DECLINED_PENDING_HUMAN}, "Approval requires a pending human decision state")
+        self._ensure(self.compliance_completed, "Application cannot be approved while compliance is pending")
+        self._transition(LoanApplicationState.FINAL_APPROVED)
+        self.final_decision = "APPROVE"
+
+    def _on_ApplicationDeclined(self, event, _: dict) -> None:
+        self.decline_reasons = list(event.decline_reasons)
+        if self.compliance_hard_block and self.state == LoanApplicationState.COMPLIANCE_REVIEW:
+            self._transition(LoanApplicationState.FINAL_DECLINED)
+        else:
+            self._ensure(self.state in {LoanApplicationState.DECLINED_PENDING_HUMAN, LoanApplicationState.APPROVED_PENDING_HUMAN}, "Decline requires a pending human decision state")
+            self._transition(LoanApplicationState.FINAL_DECLINED)
+        self.final_decision = "DECLINE"
+
+    def mark_package_ready(self) -> None:
+        self.package_ready = True
+
+    def mark_compliance_completed(self, has_hard_block: bool) -> None:
+        self.compliance_completed = True
+        self.compliance_hard_block = has_hard_block
+
+    def assert_can_submit(self) -> None:
+        self._ensure(self.version == -1, "Application has already been submitted")
+
+    def assert_awaiting_credit_analysis(self) -> None:
+        self._ensure(self.state == LoanApplicationState.AWAITING_ANALYSIS, "Application is not awaiting analysis")
+        self._ensure(self.package_ready, "Document package must be ready before credit analysis completes")
+
+    def assert_ready_for_compliance(self) -> None:
+        self._ensure(self.state == LoanApplicationState.AWAITING_ANALYSIS, "Application is not ready to enter compliance review")
+        self._ensure(self.fraud_requested, "Fraud screening must complete before compliance review")
+
+    def assert_pending_decision(self) -> None:
+        self._ensure(self.state == LoanApplicationState.PENDING_DECISION, "Application is not pending a decision")
+

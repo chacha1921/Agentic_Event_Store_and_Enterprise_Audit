@@ -30,6 +30,39 @@ def _chain_hash(previous_hash: str | None, event_hashes: list[str]) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def _verify_existing_chain(primary_events: list[Any], audit_events: list[Any]) -> tuple[bool, bool, str | None, int]:
+    prior_hash: str | None = None
+    verified_count = 0
+    chain_valid = True
+    tamper_detected = False
+
+    integrity_events = [event for event in audit_events if event.event_type == "AuditIntegrityCheckRun"]
+    for integrity_event in integrity_events:
+        payload = integrity_event.payload
+        recorded_count = int(payload.get("events_verified_count", 0))
+        if recorded_count < verified_count:
+            return False, True, prior_hash, verified_count
+        if payload.get("previous_hash") != prior_hash:
+            return False, True, prior_hash, verified_count
+
+        segment = primary_events[verified_count:recorded_count]
+        if len(segment) != recorded_count - verified_count:
+            return False, True, prior_hash, verified_count
+
+        segment_hashes = [_payload_hash(event.payload) for event in segment]
+        expected_hash = _chain_hash(prior_hash, segment_hashes)
+        if expected_hash != payload.get("integrity_hash"):
+            return False, True, prior_hash, verified_count
+        if not bool(payload.get("chain_valid", True)) or bool(payload.get("tamper_detected", False)):
+            chain_valid = False
+            tamper_detected = True
+
+        prior_hash = payload.get("integrity_hash")
+        verified_count = recorded_count
+
+    return chain_valid, tamper_detected, prior_hash, verified_count
+
+
 async def run_integrity_check(store: EventStore, entity_type: str, entity_id: str) -> dict[str, Any]:
     """Compute and append a tamper-evident audit hash for a single entity stream."""
     primary_stream_id = f"{entity_type}-{entity_id}"
@@ -39,30 +72,16 @@ async def run_integrity_check(store: EventStore, entity_type: str, entity_id: st
     audit_events = await store.load_stream(audit_stream_id, from_position=0)
     audit_aggregate = await AuditLedgerAggregate.load(store, f"{entity_type}-{entity_id}")
 
-    prior_check = None
-    for event in reversed(audit_events):
-        if event.event_type == "AuditIntegrityCheckRun":
-            prior_check = event
-            break
-
-    previously_verified = 0
-    previous_hash = None
-    chain_valid = True
-    if prior_check is not None:
-        previous_hash = prior_check.payload.get("integrity_hash")
-        previously_verified = int(prior_check.payload.get("events_verified_count", 0))
-        chain_valid = bool(prior_check.payload.get("chain_valid", True)) and not bool(
-            prior_check.payload.get("tamper_detected", False)
-        )
+    chain_valid, tamper_detected, previous_hash, previously_verified = _verify_existing_chain(primary_events, audit_events)
 
     events_to_verify = primary_events[previously_verified:]
     event_hashes = [_payload_hash(event.payload) for event in events_to_verify]
     new_hash = _chain_hash(previous_hash, event_hashes)
     expected_total = previously_verified + len(events_to_verify)
-    tamper_detected = len(primary_events) < previously_verified
+    tamper_detected = tamper_detected or len(primary_events) < previously_verified
     chain_valid = chain_valid and not tamper_detected
 
-    if audit_aggregate.checks_run > 0:
+    if audit_aggregate.checks_run > 0 and not tamper_detected:
         if audit_aggregate.last_integrity_hash != previous_hash:
             raise DomainError("AuditLedger aggregate chain head does not match the prior integrity event")
         if expected_total < audit_aggregate.last_verified_count:
@@ -87,6 +106,7 @@ async def run_integrity_check(store: EventStore, entity_type: str, entity_id: st
         "entity_id": entity_id,
         "stream_id": primary_stream_id,
         "audit_stream_id": audit_stream_id,
+        "events_verified": expected_total,
         "events_verified_count": expected_total,
         "new_events_hashed": len(events_to_verify),
         "previous_hash": previous_hash,

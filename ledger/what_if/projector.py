@@ -30,8 +30,25 @@ CAUSAL_SKIP_BY_BRANCH: dict[str, set[str]] = {
         "ApplicationDeclined",
     },
     "CreditAnalysisRequested": {
+        "CreditAnalysisCompleted",
         "FraudScreeningRequested",
+        "FraudScreeningCompleted",
         "ComplianceCheckRequested",
+        "ComplianceCheckInitiated",
+        "ComplianceCheckCompleted",
+        "DecisionRequested",
+        "DecisionGenerated",
+        "HumanReviewRequested",
+        "HumanReviewCompleted",
+        "ApplicationApproved",
+        "ApplicationDeclined",
+    },
+    "CreditAnalysisCompleted": {
+        "FraudScreeningRequested",
+        "FraudScreeningCompleted",
+        "ComplianceCheckRequested",
+        "ComplianceCheckInitiated",
+        "ComplianceCheckCompleted",
         "DecisionRequested",
         "DecisionGenerated",
         "HumanReviewRequested",
@@ -72,6 +89,24 @@ CAUSAL_SKIP_BY_BRANCH: dict[str, set[str]] = {
     "HumanReviewRequested": {"HumanReviewCompleted", "ApplicationApproved", "ApplicationDeclined"},
     "HumanReviewCompleted": {"ApplicationApproved", "ApplicationDeclined"},
 }
+
+
+def _is_related_event(event: StoredEvent, application_id: str) -> bool:
+    payload = event.payload or {}
+    if payload.get("application_id") == application_id:
+        return True
+    if payload.get("package_id") == application_id:
+        return True
+    if payload.get("entity_id") == application_id:
+        return True
+    return event.stream_id in {
+        f"loan-{application_id}",
+        f"docpkg-{application_id}",
+        f"credit-{application_id}",
+        f"fraud-{application_id}",
+        f"compliance-{application_id}",
+        f"audit-loan-{application_id}",
+    }
 
 
 def _normalize_timestamp(value: datetime) -> datetime:
@@ -188,6 +223,31 @@ def _depends_on_branch(event: StoredEvent, branch_event: StoredEvent, injected_e
     return False
 
 
+async def _load_related_events(store: EventStore, application_id: str) -> list[StoredEvent]:
+    related: list[StoredEvent] = []
+    async for event in store.load_all(from_global_position=0):
+        if _is_related_event(event, application_id):
+            related.append(event)
+    related.sort(key=lambda event: (event.global_position, event.stream_position))
+    return related
+
+
+async def _replay_outcome(application_id: str, events: list[StoredEvent], projections: list[Projection]) -> dict[str, Any]:
+    scratch_store = InMemoryEventStore()
+    projection_clones = [_clone_projection(projection, scratch_store) for projection in projections]
+    for projection in projection_clones:
+        setup = getattr(projection, "setup", None)
+        if callable(setup):
+            await setup()
+    for event in events:
+        for projection in projection_clones:
+            await projection.apply(event)
+    return {
+        projection.checkpoint_name: await _extract_projection_outcome(projection, application_id)
+        for projection in projection_clones
+    }
+
+
 async def _extract_projection_outcome(projection: Projection, application_id: str) -> Any:
     if hasattr(projection, "get_current"):
         result = await projection.get_current(application_id)
@@ -213,27 +273,26 @@ async def run_what_if(
     projections: list[Projection],
 ) -> dict[str, Any]:
     """Replay a counterfactual branch entirely in memory without writing to the database."""
-    real_events = await store.load_stream(f"loan-{application_id}")
+    real_events = await _load_related_events(store, application_id)
 
     branch_index = next((index for index, event in enumerate(real_events) if event.event_type == branch_at_event_type), None)
     if branch_index is None:
-        raise ValueError(f"Branch event type '{branch_at_event_type}' was not found in loan-{application_id}")
+        raise ValueError(f"Branch event type '{branch_at_event_type}' was not found for application '{application_id}'")
 
     branch_event = real_events[branch_index]
-    scratch_store = InMemoryEventStore()
-    projection_clones = [_clone_projection(projection, scratch_store) for projection in projections]
-    for projection in projection_clones:
-        setup = getattr(projection, "setup", None)
-        if callable(setup):
-            await setup()
+    real_outcome = await _replay_outcome(application_id, real_events, projections)
 
     applied_events: list[StoredEvent] = []
+    divergence_events: list[dict[str, Any]] = [
+        {
+            "type": "branch_replaced",
+            "real_event": _jsonable(branch_event.to_dict()),
+        }
+    ]
 
     for ordinal, event in enumerate(real_events[:branch_index], start=1):
         synthetic = _synthetic_from_real(event, ordinal)
         applied_events.append(synthetic)
-        for projection in projection_clones:
-            await projection.apply(synthetic)
 
     injected_events: list[StoredEvent] = []
     branch_global_base = branch_event.global_position * 1000
@@ -247,29 +306,32 @@ async def run_what_if(
         )
         injected_events.append(synthetic)
         applied_events.append(synthetic)
-        for projection in projection_clones:
-            await projection.apply(synthetic)
+        divergence_events.append(
+            {
+                "type": "counterfactual_injected",
+                "event": _jsonable(synthetic.to_dict()),
+            }
+        )
 
     skipped_events: list[dict[str, Any]] = []
     for ordinal, event in enumerate(real_events[branch_index + 1 :], start=1):
         if _depends_on_branch(event, branch_event, injected_events):
-            skipped_events.append(_jsonable(event.to_dict()))
+            skipped_event = _jsonable(event.to_dict())
+            skipped_events.append(skipped_event)
+            divergence_events.append({"type": "real_event_skipped", "event": skipped_event})
             continue
         synthetic = _synthetic_from_real(event, ordinal)
         applied_events.append(synthetic)
-        for projection in projection_clones:
-            await projection.apply(synthetic)
 
-    outcomes = {
-        projection.checkpoint_name: await _extract_projection_outcome(projection, application_id)
-        for projection in projection_clones
-    }
+    counterfactual_outcome = await _replay_outcome(application_id, applied_events, projections)
 
     return {
         "application_id": application_id,
         "branch_event": _jsonable(branch_event.to_dict()),
+        "real_outcome": real_outcome,
         "counterfactual_events": [_jsonable(event.to_dict()) for event in injected_events],
         "skipped_real_events": skipped_events,
+        "divergence_events": divergence_events,
         "applied_event_count": len(applied_events),
-        "counterfactual_outcome": outcomes,
+        "counterfactual_outcome": counterfactual_outcome,
     }

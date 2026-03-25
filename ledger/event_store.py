@@ -81,6 +81,14 @@ class StoredEvent(StorageModel):
     def domain_data(self) -> dict[str, Any]:
         return dict(self.payload)
 
+    def with_payload(self, payload: dict[str, Any], version: int | None = None) -> "StoredEvent":
+        return self.model_copy(
+            update={
+                "payload": dict(payload),
+                "event_version": self.event_version if version is None else version,
+            }
+        )
+
 
 class StreamMetadata(StorageModel):
     """Storage metadata for an aggregate stream lifecycle."""
@@ -156,14 +164,15 @@ class EventStore:
             raise ValueError(f"Expected '{field_name}' JSON object but found {type(parsed).__name__}")
         raise ValueError(f"Expected '{field_name}' to be a mapping or JSON string, got {type(value).__name__}")
 
-    def _deserialize_event(self, row: asyncpg.Record) -> StoredEvent:
+    async def _deserialize_event(self, row: asyncpg.Record) -> StoredEvent:
         event = dict(row)
         event["event_id"] = str(event["event_id"])
         event["payload"] = self._coerce_json_object(event.get("payload"), "payload")
         event["metadata"] = self._coerce_json_object(event.get("metadata"), "metadata")
+        stored_event = StoredEvent.model_validate(event)
         if self.upcasters:
-            event = self.upcasters.upcast(event)
-        return StoredEvent.model_validate(event)
+            return await self.upcasters.upcast(stored_event, store=self)
+        return stored_event
 
     def _deserialize_stream_metadata(self, row: asyncpg.Record) -> StreamMetadata:
         stream_metadata = dict(row)
@@ -358,7 +367,7 @@ class EventStore:
 
         async with pool.acquire() as conn:
             rows = await conn.fetch(query, *params)
-            return [self._deserialize_event(row) for row in rows]
+            return [await self._deserialize_event(row) for row in rows]
 
     async def load_all(
         self,
@@ -431,7 +440,7 @@ class EventStore:
                     break
 
                 for row in rows:
-                    yield self._deserialize_event(row)
+                    yield await self._deserialize_event(row)
 
                 current_position = rows[-1]["global_position"] + 1
                 if len(rows) < batch_size:
@@ -458,7 +467,7 @@ class EventStore:
                 """,
                 event_id,
             )
-            return self._deserialize_event(row) if row else None
+            return await self._deserialize_event(row) if row else None
 
     async def get_stream_metadata(self, stream_id: str) -> StreamMetadata:
         """Return stream lifecycle metadata for an existing stream."""
@@ -626,7 +635,7 @@ class InMemoryEventStore:
         ]
         events.sort(key=lambda event: event["stream_position"])
         if self.upcasters:
-            return [StoredEvent.model_validate(self.upcasters.upcast(event.to_dict())) for event in events]
+            return [await self.upcasters.upcast(event, store=self) for event in events]
         return events
 
     async def load_all(
@@ -649,7 +658,7 @@ class InMemoryEventStore:
                 continue
             loaded = event.model_copy(deep=True)
             if self.upcasters:
-                loaded = StoredEvent.model_validate(self.upcasters.upcast(loaded.to_dict()))
+                loaded = await self.upcasters.upcast(loaded, store=self)
             yield loaded
 
     async def get_event(self, event_id: UUID | str) -> StoredEvent | None:
@@ -657,7 +666,7 @@ class InMemoryEventStore:
             if event["event_id"] == str(event_id):
                 loaded = event.model_copy(deep=True)
                 if self.upcasters:
-                    return StoredEvent.model_validate(self.upcasters.upcast(loaded.to_dict()))
+                    return await self.upcasters.upcast(loaded, store=self)
                 return loaded
         return None
 

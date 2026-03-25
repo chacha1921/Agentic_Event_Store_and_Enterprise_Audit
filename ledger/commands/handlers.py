@@ -6,9 +6,13 @@ from decimal import Decimal
 from pydantic import BaseModel, Field
 
 from ledger.domain.aggregates.agent_session import AgentSessionAggregate
+from ledger.domain.aggregates.audit_ledger import AuditLedgerAggregate
+from ledger.domain.aggregates.compliance_record import ComplianceRecordAggregate
 from ledger.domain.aggregates.loan_application import LoanApplicationAggregate
 from ledger.domain.errors import DomainError
+from ledger.event_store import assigned_positions_from_new_version
 from ledger.schema.events import (
+    AgentOutputWritten,
     AgentType,
     ApplicationApproved,
     ApplicationDeclined,
@@ -60,6 +64,9 @@ class CreditAnalysisCompletedCommand(TraceableCommand):
     session_id: str | None = None
     agent_type: AgentType = AgentType.CREDIT_ANALYSIS
     model_version: str | None = None
+    source_events: list[dict] = Field(default_factory=list)
+    loan_source_events: list[dict] = Field(default_factory=list)
+    document_package_source_events: list[dict] = Field(default_factory=list)
 
 
 class FraudScreeningCompletedCommand(TraceableCommand):
@@ -70,6 +77,9 @@ class FraudScreeningCompletedCommand(TraceableCommand):
     rules_to_evaluate: list[str] = Field(
         default_factory=lambda: ["REG-001", "REG-002", "REG-003", "REG-004", "REG-005", "REG-006"]
     )
+    session_id: str | None = None
+    agent_type: AgentType = AgentType.FRAUD_DETECTION
+    source_events: list[dict] = Field(default_factory=list)
 
 
 class ComplianceCheckCompletedCommand(TraceableCommand):
@@ -79,6 +89,9 @@ class ComplianceCheckCompletedCommand(TraceableCommand):
     has_hard_block: bool
     decline_reasons: list[str] = Field(default_factory=list)
     adverse_action_codes: list[str] = Field(default_factory=list)
+    session_id: str | None = None
+    agent_type: AgentType = AgentType.COMPLIANCE
+    source_events: list[dict] = Field(default_factory=list)
 
 
 class DecisionGeneratedCommand(TraceableCommand):
@@ -120,6 +133,43 @@ def _trace_kwargs(cmd: TraceableCommand) -> dict:
     }
 
 
+async def _append_source_events(store, stream_id: str, source_events: list[dict]) -> None:
+    if not source_events:
+        return
+    version = await store.stream_version(stream_id)
+    await store.append(stream_id, list(source_events), expected_version=version)
+
+
+async def _append_agent_output_written(
+    store,
+    *,
+    session_id: str | None,
+    agent_type: AgentType,
+    application_id: str,
+    events_written: list[dict],
+    output_summary: str,
+) -> None:
+    if session_id is None or not events_written:
+        return
+    stream_id = f"agent-{agent_type.value}-{session_id}"
+    version = await store.stream_version(stream_id)
+    if version < 0:
+        raise DomainError(f"Agent session '{session_id}' was not found for {agent_type.value}")
+    output_event = AgentOutputWritten(
+        session_id=session_id,
+        agent_type=agent_type,
+        application_id=application_id,
+        events_written=events_written,
+        output_summary=output_summary,
+        written_at=datetime.now(),
+    ).to_store_dict()
+    await store.append(stream_id, [output_event], expected_version=version)
+
+
+def _positions_from_append_result(new_version: int, event_count: int) -> list[int]:
+    return assigned_positions_from_new_version(new_version, event_count)
+
+
 async def handle_submit_application(store, cmd: SubmitApplicationCommand) -> list[int]:
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
     app.assert_can_submit()
@@ -143,44 +193,75 @@ async def handle_submit_application(store, cmd: SubmitApplicationCommand) -> lis
         requested_by=cmd.requested_by,
     ).to_store_dict()
 
-    return await store.append(
+    new_version = await store.append(
         f"loan-{cmd.application_id}",
         [submitted, docs_requested],
         expected_version=app.version,
         **_trace_kwargs(cmd),
     )
+    return _positions_from_append_result(new_version, 2)
 
 
 async def handle_credit_analysis_completed(store, cmd: CreditAnalysisCompletedCommand) -> list[int]:
+    await _append_source_events(store, f"loan-{cmd.application_id}", cmd.loan_source_events)
+    await _append_source_events(store, f"docpkg-{cmd.application_id}", cmd.document_package_source_events)
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
     await app.assert_credit_analysis_completion_ready(store)
+    await app.assert_credit_analysis_writable(store)
 
     if cmd.session_id is not None:
         session = await AgentSessionAggregate.load(store, cmd.agent_type.value, cmd.session_id)
+        session.assert_context_loaded()
         session.assert_started()
-        session.assert_model_version_locked(cmd.model_version)
+        session.assert_model_version_current(cmd.model_version)
         if session.application_id is not None and session.application_id != cmd.application_id:
             raise DomainError("Credit analysis session does not belong to this application")
+
+    await _append_source_events(store, f"credit-{cmd.application_id}", cmd.source_events)
+    credit_events = await store.load_stream(f"credit-{cmd.application_id}")
+    if not any(event.get("event_type") == "CreditAnalysisCompleted" for event in credit_events):
+        raise DomainError("Credit analysis completion requires a CreditAnalysisCompleted event in the credit stream")
+    await _append_agent_output_written(
+        store,
+        session_id=cmd.session_id,
+        agent_type=cmd.agent_type,
+        application_id=cmd.application_id,
+        events_written=cmd.source_events,
+        output_summary="Credit analysis result written to credit stream.",
+    )
 
     fraud_requested = FraudScreeningRequested(
         application_id=cmd.application_id,
         requested_at=cmd.requested_at,
         triggered_by_event_id=cmd.triggered_by_event_id,
     ).to_store_dict()
-    return await store.append(
+    new_version = await store.append(
         f"loan-{cmd.application_id}",
         [fraud_requested],
         expected_version=app.version,
         **_trace_kwargs(cmd),
     )
+    return _positions_from_append_result(new_version, 1)
 
 
 async def handle_fraud_screening_completed(store, cmd: FraudScreeningCompletedCommand) -> list[int]:
+    await _append_source_events(store, f"fraud-{cmd.application_id}", cmd.source_events)
+    await _append_agent_output_written(
+        store,
+        session_id=cmd.session_id,
+        agent_type=cmd.agent_type,
+        application_id=cmd.application_id,
+        events_written=cmd.source_events,
+        output_summary="Fraud screening result written to fraud stream.",
+    )
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
     package_events = await store.load_stream(f"docpkg-{cmd.application_id}")
     if any(event.get("event_type") == "PackageReadyForAnalysis" for event in package_events):
         app.mark_package_ready()
     app.assert_awaiting_credit_analysis()
+    fraud_events = await store.load_stream(f"fraud-{cmd.application_id}")
+    if not any(event.get("event_type") == "FraudScreeningCompleted" for event in fraud_events):
+        raise DomainError("Fraud screening completion requires a FraudScreeningCompleted event in the fraud stream")
 
     compliance_requested = ComplianceCheckRequested(
         application_id=cmd.application_id,
@@ -189,16 +270,31 @@ async def handle_fraud_screening_completed(store, cmd: FraudScreeningCompletedCo
         regulation_set_version=cmd.regulation_set_version,
         rules_to_evaluate=cmd.rules_to_evaluate,
     ).to_store_dict()
-    return await store.append(
+    new_version = await store.append(
         f"loan-{cmd.application_id}",
         [compliance_requested],
         expected_version=app.version,
         **_trace_kwargs(cmd),
     )
+    return _positions_from_append_result(new_version, 1)
 
 
 async def handle_compliance_check_completed(store, cmd: ComplianceCheckCompletedCommand) -> list[int]:
+    await _append_source_events(store, f"compliance-{cmd.application_id}", cmd.source_events)
+    await _append_agent_output_written(
+        store,
+        session_id=cmd.session_id,
+        agent_type=cmd.agent_type,
+        application_id=cmd.application_id,
+        events_written=cmd.source_events,
+        output_summary="Compliance result written to compliance stream.",
+    )
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
+    compliance = await ComplianceRecordAggregate.load(store, cmd.application_id)
+    if not compliance.completed:
+        raise DomainError("Compliance transition requires ComplianceCheckCompleted in the compliance stream")
+    if compliance.has_hard_block != cmd.has_hard_block:
+        raise DomainError("Loan transition hard-block flag does not match ComplianceRecord aggregate state")
     app.mark_compliance_completed(cmd.has_hard_block)
 
     if cmd.has_hard_block:
@@ -210,12 +306,13 @@ async def handle_compliance_check_completed(store, cmd: ComplianceCheckCompleted
             adverse_action_codes=cmd.adverse_action_codes or ["COMPLIANCE_BLOCK"],
             declined_at=cmd.requested_at,
         ).to_store_dict()
-        return await store.append(
+        new_version = await store.append(
             f"loan-{cmd.application_id}",
             [decline],
             expected_version=app.version,
             **_trace_kwargs(cmd),
         )
+        return _positions_from_append_result(new_version, 1)
 
     decision_requested = DecisionRequested(
         application_id=cmd.application_id,
@@ -223,17 +320,32 @@ async def handle_compliance_check_completed(store, cmd: ComplianceCheckCompleted
         all_analyses_complete=True,
         triggered_by_event_id=cmd.triggered_by_event_id,
     ).to_store_dict()
-    return await store.append(
+    new_version = await store.append(
         f"loan-{cmd.application_id}",
         [decision_requested],
         expected_version=app.version,
         **_trace_kwargs(cmd),
     )
+    return _positions_from_append_result(new_version, 1)
 
 
 async def handle_decision_generated(store, cmd: DecisionGeneratedCommand) -> list[int]:
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
     app.assert_pending_decision()
+
+    for session_id in cmd.contributing_sessions:
+        session_found = False
+        for agent_type in AgentType:
+            candidate_stream = f"agent-{agent_type.value}-{session_id}"
+            if await store.stream_version(candidate_stream) >= 0:
+                session_found = True
+                session = await AgentSessionAggregate.load(store, agent_type.value, session_id)
+                if session.application_id is not None and session.application_id != cmd.application_id:
+                    raise DomainError("Contributing session does not belong to this application")
+                session.assert_processed_application_decision()
+                break
+        if not session_found:
+            raise DomainError(f"Contributing session '{session_id}' was not found in any agent session stream")
 
     recommendation = cmd.recommendation.upper()
     if cmd.confidence < 0.60:
@@ -265,18 +377,18 @@ async def handle_decision_generated(store, cmd: DecisionGeneratedCommand) -> lis
         ).to_store_dict()
         events.append(review_requested)
 
-    return await store.append(
+    new_version = await store.append(
         f"loan-{cmd.application_id}",
         events,
         expected_version=app.version,
         **_trace_kwargs(cmd),
     )
+    return _positions_from_append_result(new_version, len(events))
 
 
 async def handle_human_review_completed(store, cmd: HumanReviewCompletedCommand) -> list[int]:
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
-    if not (app.decision_generated or app.human_review_requested):
-        raise DomainError("Human review cannot complete before a decision is generated")
+    app.assert_human_review_completable()
 
     review_event = HumanReviewCompleted(
         application_id=cmd.application_id,
@@ -290,6 +402,7 @@ async def handle_human_review_completed(store, cmd: HumanReviewCompletedCommand)
 
     final_decision = cmd.final_decision.upper()
     if final_decision == "APPROVE":
+        await app.assert_approval_requirements_satisfied(store)
         final_event = ApplicationApproved(
             application_id=cmd.application_id,
             approved_amount_usd=cmd.approved_amount_usd or Decimal("0"),
@@ -312,8 +425,9 @@ async def handle_human_review_completed(store, cmd: HumanReviewCompletedCommand)
     else:
         raise DomainError(f"Unsupported final decision: {final_decision}")
 
-    return await store.append(
+    new_version = await store.append(
         f"loan-{cmd.application_id}",
         [review_event, final_event],
         expected_version=app.version,
     )
+    return _positions_from_append_result(new_version, 2)

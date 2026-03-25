@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS events (
     payload JSONB NOT NULL,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     recorded_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    CONSTRAINT uq_events_stream_position UNIQUE (stream_id, stream_position)
+    CONSTRAINT uq_stream_position UNIQUE (stream_id, stream_position),
+    CONSTRAINT ck_events_stream_position_nonnegative CHECK (stream_position >= 0),
+    CONSTRAINT ck_events_event_version_positive CHECK (event_version > 0)
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_stream_position
@@ -31,7 +33,8 @@ CREATE TABLE IF NOT EXISTS event_streams (
     current_version BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     archived_at TIMESTAMPTZ,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    CONSTRAINT ck_event_streams_current_version_nonnegative CHECK (current_version >= 0)
 );
 
 ALTER TABLE event_streams
@@ -43,7 +46,8 @@ CREATE INDEX IF NOT EXISTS idx_event_streams_aggregate_type
 CREATE TABLE IF NOT EXISTS projection_checkpoints (
     projection_name TEXT PRIMARY KEY,
     last_position BIGINT NOT NULL DEFAULT 0,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_projection_checkpoints_last_position_nonnegative CHECK (last_position >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS outbox (
@@ -53,9 +57,13 @@ CREATE TABLE IF NOT EXISTS outbox (
     payload JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     published_at TIMESTAMPTZ,
-    attempts SMALLINT NOT NULL DEFAULT 0
+    attempts SMALLINT NOT NULL DEFAULT 0,
+    CONSTRAINT ck_outbox_attempts_nonnegative CHECK (attempts >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS idx_outbox_unpublished
     ON outbox (created_at)
     WHERE published_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_outbox_destination_published
+    ON outbox (destination, published_at, created_at);

@@ -93,6 +93,13 @@ class StreamMetadata(StorageModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+def assigned_positions_from_new_version(new_version: int, event_count: int) -> list[int]:
+    if event_count <= 0:
+        return []
+    start_position = new_version - event_count + 1
+    return list(range(start_position, new_version + 1))
+
+
 class EventStore:
     """
     Append-only PostgreSQL event store.
@@ -176,12 +183,12 @@ class EventStore:
     async def append(
         self,
         stream_id: str,
-        events: list[dict],
+        events: list[Any],
         expected_version: int,
         correlation_id: str | None = None,
         causation_id: str | None = None,
         metadata: dict | None = None,
-    ) -> list[int]:
+    ) -> int:
         """
         Append events atomically with optimistic concurrency control.
 
@@ -192,9 +199,11 @@ class EventStore:
         4. Insert immutable event rows into `events`.
         5. Insert matching outbox rows for downstream delivery.
         6. Advance the stream cursor in `event_streams`.
+
+        Returns the new stream version after the append succeeds.
         """
         if not events:
-            return []
+            return expected_version
 
         pool = self._require_pool()
         base_metadata = dict(metadata or {})
@@ -232,9 +241,9 @@ class EventStore:
                     )
 
                 next_position = 1 if current_version == -1 else current_version + 1
-                assigned_positions: list[int] = []
+                normalized_events = [self._normalize_event_input(event) for event in events]
 
-                for offset, event in enumerate(events):
+                for offset, event in enumerate(normalized_events):
                     stream_position = next_position + offset
                     event_payload = dict(event.get("payload") or {})
                     event_metadata = {**base_metadata, **dict(event.get("metadata") or {})}
@@ -283,9 +292,7 @@ class EventStore:
                         "event_bus",
                         json.dumps(outbox_payload),
                     )
-                    assigned_positions.append(stream_position)
-
-                new_version = assigned_positions[-1]
+                new_version = next_position + len(normalized_events) - 1
                 if metadata:
                     await conn.execute(
                         """
@@ -304,7 +311,17 @@ class EventStore:
                         new_version,
                         stream_id,
                     )
-                return assigned_positions
+                return new_version
+
+    @staticmethod
+    def _normalize_event_input(event: Any) -> dict[str, Any]:
+        if hasattr(event, "to_store_dict"):
+            return dict(event.to_store_dict())
+        if hasattr(event, "model_dump"):
+            return dict(event.model_dump(mode="python"))
+        if isinstance(event, Mapping):
+            return dict(event)
+        raise TypeError(f"Unsupported event input type: {type(event).__name__}")
 
     async def load_stream(
         self,
@@ -345,8 +362,10 @@ class EventStore:
 
     async def load_all(
         self,
-        from_position: int = 0,
+        from_global_position: int = 0,
+        event_types: list[str] | None = None,
         batch_size: int = 500,
+        **kwargs: Any,
     ) -> AsyncGenerator[StoredEvent, None]:
         """
         Yield all events globally ordered by `global_position`.
@@ -355,29 +374,59 @@ class EventStore:
         checkpoint without touching the write model.
         """
         pool = self._require_pool()
+        if "from_position" in kwargs:
+            from_global_position = kwargs.pop("from_position")
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected load_all keyword argument(s): {unexpected}")
+
         async with pool.acquire() as conn:
-            current_position = from_position
+            current_position = from_global_position
             while True:
-                rows = await conn.fetch(
-                    """
-                    SELECT
-                        event_id,
-                        global_position,
-                        stream_id,
-                        stream_position,
-                        event_type,
-                        event_version,
-                        payload,
-                        metadata,
-                        recorded_at
-                    FROM events
-                    WHERE global_position >= $1
-                    ORDER BY global_position ASC
-                    LIMIT $2
-                    """,
-                    current_position,
-                    batch_size,
-                )
+                if event_types:
+                    rows = await conn.fetch(
+                        """
+                        SELECT
+                            event_id,
+                            global_position,
+                            stream_id,
+                            stream_position,
+                            event_type,
+                            event_version,
+                            payload,
+                            metadata,
+                            recorded_at
+                        FROM events
+                        WHERE global_position >= $1
+                          AND event_type = ANY($2::text[])
+                        ORDER BY global_position ASC
+                        LIMIT $3
+                        """,
+                        current_position,
+                        event_types,
+                        batch_size,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        """
+                        SELECT
+                            event_id,
+                            global_position,
+                            stream_id,
+                            stream_position,
+                            event_type,
+                            event_version,
+                            payload,
+                            metadata,
+                            recorded_at
+                        FROM events
+                        WHERE global_position >= $1
+                        ORDER BY global_position ASC
+                        LIMIT $2
+                        """,
+                        current_position,
+                        batch_size,
+                    )
                 if not rows:
                     break
 
@@ -411,8 +460,8 @@ class EventStore:
             )
             return self._deserialize_event(row) if row else None
 
-    async def get_stream_metadata(self, stream_id: str) -> StreamMetadata | None:
-        """Return stream lifecycle metadata, or None if the stream does not exist."""
+    async def get_stream_metadata(self, stream_id: str) -> StreamMetadata:
+        """Return stream lifecycle metadata for an existing stream."""
         pool = self._require_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -430,7 +479,7 @@ class EventStore:
                 stream_id,
             )
             if row is None:
-                return None
+                raise ValueError(f"Stream '{stream_id}' does not exist")
             return self._deserialize_stream_metadata(row)
 
     async def archive_stream(self, stream_id: str, archived_at: datetime | None = None) -> None:
@@ -500,12 +549,12 @@ class InMemoryEventStore:
     async def append(
         self,
         stream_id: str,
-        events: list[dict],
+        events: list[Any],
         expected_version: int,
         correlation_id: str | None = None,
         causation_id: str | None = None,
         metadata: dict | None = None,
-    ) -> list[int]:
+    ) -> int:
         async with self._locks[stream_id]:
             current = self._versions.get(stream_id, -1)
             if current != expected_version:
@@ -540,8 +589,8 @@ class InMemoryEventStore:
                     }
                 )
 
-            assigned_positions: list[int] = []
-            for offset, event in enumerate(events):
+            normalized_events = [EventStore._normalize_event_input(event) for event in events]
+            for offset, event in enumerate(normalized_events):
                 stream_position = current + 1 + offset
                 stored = StoredEvent(
                     event_id=str(uuid4()),
@@ -556,13 +605,12 @@ class InMemoryEventStore:
                 )
                 self._streams[stream_id].append(stored)
                 self._global.append(stored)
-                assigned_positions.append(stream_position)
 
-            self._versions[stream_id] = current + len(events)
+            self._versions[stream_id] = current + len(normalized_events)
             self._stream_metadata[stream_id] = self._stream_metadata[stream_id].model_copy(
                 update={"current_version": self._versions[stream_id]}
             )
-            return assigned_positions
+            return self._versions[stream_id]
 
     async def load_stream(
         self,
@@ -581,14 +629,28 @@ class InMemoryEventStore:
             return [StoredEvent.model_validate(self.upcasters.upcast(event.to_dict())) for event in events]
         return events
 
-    async def load_all(self, from_position: int = 0, batch_size: int = 500):
+    async def load_all(
+        self,
+        from_global_position: int = 0,
+        event_types: list[str] | None = None,
+        batch_size: int = 500,
+        **kwargs: Any,
+    ):
         del batch_size
+        if "from_position" in kwargs:
+            from_global_position = kwargs.pop("from_position")
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected load_all keyword argument(s): {unexpected}")
         for event in self._global:
-            if event["global_position"] >= from_position:
-                loaded = event.model_copy(deep=True)
-                if self.upcasters:
-                    loaded = StoredEvent.model_validate(self.upcasters.upcast(loaded.to_dict()))
-                yield loaded
+            if event["global_position"] < from_global_position:
+                continue
+            if event_types is not None and event["event_type"] not in event_types:
+                continue
+            loaded = event.model_copy(deep=True)
+            if self.upcasters:
+                loaded = StoredEvent.model_validate(self.upcasters.upcast(loaded.to_dict()))
+            yield loaded
 
     async def get_event(self, event_id: UUID | str) -> StoredEvent | None:
         for event in self._global:
@@ -599,10 +661,10 @@ class InMemoryEventStore:
                 return loaded
         return None
 
-    async def get_stream_metadata(self, stream_id: str) -> StreamMetadata | None:
+    async def get_stream_metadata(self, stream_id: str) -> StreamMetadata:
         metadata = self._stream_metadata.get(stream_id)
         if metadata is None:
-            return None
+            raise ValueError(f"Stream '{stream_id}' does not exist")
         return metadata.model_copy(deep=True)
 
     async def archive_stream(self, stream_id: str, archived_at: datetime | None = None) -> None:

@@ -396,6 +396,15 @@ class PackageReadyForAnalysis(BaseEvent):
 # ─── AGGREGATE 3: AGENT SESSION ──────────────────────────────────────────────
 # stream: "agent-{agent_type}-{session_id}"
 
+class AgentContextLoaded(BaseEvent):
+    event_type: str = "AgentContextLoaded"
+    session_id: str
+    agent_type: AgentType
+    application_id: str
+    context_source: str
+    context_token_count: int
+    loaded_at: datetime
+
 class AgentSessionStarted(BaseEvent):
     event_type: str = "AgentSessionStarted"
     session_id: str
@@ -680,6 +689,7 @@ EVENT_REGISTRY: dict[str, type[BaseEvent]] = {
     "QualityAssessmentCompleted": QualityAssessmentCompleted,
     "PackageReadyForAnalysis": PackageReadyForAnalysis,
     # AgentSession
+    "AgentContextLoaded": AgentContextLoaded,
     "AgentSessionStarted": AgentSessionStarted,
     "AgentInputValidated": AgentInputValidated,
     "AgentInputValidationFailed": AgentInputValidationFailed,

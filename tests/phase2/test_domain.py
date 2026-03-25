@@ -28,6 +28,7 @@ from ledger.domain.aggregates.loan_application import (
 from ledger.domain.errors import DomainError
 from ledger.event_store import InMemoryEventStore
 from ledger.schema.events import (
+    AgentContextLoaded,
     AgentType,
     AgentSessionStarted,
     ApplicationApproved,
@@ -276,6 +277,27 @@ async def test_handle_credit_analysis_completed_writes_fraud_screening_requested
         application_id=application_id,
         triggered_by_event_id="credit-complete-001",
         requested_at=datetime.now(),
+        source_events=[
+            CreditAnalysisCompleted(
+                application_id=application_id,
+                session_id="sess-credit-001",
+                decision=CreditDecision(
+                    risk_tier=RiskTier.MEDIUM,
+                    recommended_limit_usd=Decimal("350000"),
+                    confidence=0.72,
+                    rationale="Stable business with manageable leverage.",
+                    key_concerns=["Customer concentration"],
+                    data_quality_caveats=[],
+                    policy_overrides_applied=[],
+                ),
+                model_version="claude-sonnet-4-20250514",
+                model_deployment_id="dep-credit-001",
+                input_data_hash="hash-credit-001",
+                analysis_duration_ms=1350,
+                regulatory_basis=["CREDIT-POLICY-2026-01"],
+                completed_at=datetime.now(),
+            ).to_store_dict()
+        ],
     )
 
     positions = await handle_credit_analysis_completed(store, cmd)
@@ -309,6 +331,14 @@ async def test_handle_credit_analysis_completed_validates_agent_session_and_trac
     await store.append(
         f"agent-{AgentType.CREDIT_ANALYSIS.value}-{session_id}",
         [
+            AgentContextLoaded(
+                session_id=session_id,
+                agent_type=AgentType.CREDIT_ANALYSIS,
+                application_id=application_id,
+                context_source="loan-stream",
+                context_token_count=256,
+                loaded_at=datetime.now(),
+            ).to_store_dict(),
             AgentSessionStarted(
                 session_id=session_id,
                 agent_type=AgentType.CREDIT_ANALYSIS,
@@ -332,6 +362,27 @@ async def test_handle_credit_analysis_completed_validates_agent_session_and_trac
         model_version="claude-sonnet-4-20250514",
         correlation_id="corr-001",
         causation_id="cause-001",
+        source_events=[
+            CreditAnalysisCompleted(
+                application_id=application_id,
+                session_id=session_id,
+                decision=CreditDecision(
+                    risk_tier=RiskTier.MEDIUM,
+                    recommended_limit_usd=Decimal("350000"),
+                    confidence=0.72,
+                    rationale="Stable business with manageable leverage.",
+                    key_concerns=["Customer concentration"],
+                    data_quality_caveats=[],
+                    policy_overrides_applied=[],
+                ),
+                model_version="claude-sonnet-4-20250514",
+                model_deployment_id="dep-credit-trace-001",
+                input_data_hash="hash-credit-trace-001",
+                analysis_duration_ms=1350,
+                regulatory_basis=["CREDIT-POLICY-2026-01"],
+                completed_at=datetime.now(),
+            ).to_store_dict()
+        ],
     )
 
     await handle_credit_analysis_completed(store, cmd)
@@ -340,3 +391,39 @@ async def test_handle_credit_analysis_completed_validates_agent_session_and_trac
     assert events[-1]["event_type"] == "FraudScreeningRequested"
     assert events[-1]["metadata"]["correlation_id"] == "corr-001"
     assert events[-1]["metadata"]["causation_id"] == "cause-001"
+
+
+@pytest.mark.asyncio
+async def test_credit_analysis_duplicate_requires_human_override(store: InMemoryEventStore):
+    application_id = "APEX-CREDIT-LOCK-001"
+    await store.append(f"loan-{application_id}", [_submitted_event(application_id)], expected_version=-1)
+    await _append(store, f"loan-{application_id}", _credit_requested_event(application_id))
+    await store.append(
+        f"docpkg-{application_id}",
+        [
+            PackageReadyForAnalysis(
+                package_id=application_id,
+                application_id=application_id,
+                documents_processed=3,
+                has_quality_flags=False,
+                quality_flag_count=0,
+                ready_at=datetime.now(),
+            ).to_store_dict()
+        ],
+        expected_version=-1,
+    )
+    await store.append(
+        f"credit-{application_id}",
+        [_credit_analysis_completed_event(application_id)],
+        expected_version=-1,
+    )
+
+    cmd = CreditAnalysisCompletedCommand(
+        application_id=application_id,
+        triggered_by_event_id="credit-complete-duplicate-001",
+        requested_at=datetime.now(),
+        source_events=[_credit_analysis_completed_event(application_id)],
+    )
+
+    with pytest.raises(DomainError):
+        await handle_credit_analysis_completed(store, cmd)

@@ -5,6 +5,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+from ledger.domain.aggregates.audit_ledger import AuditLedgerAggregate
+from ledger.domain.errors import DomainError
 from ledger.event_store import EventStore
 from ledger.schema.events import AuditIntegrityCheckRun
 
@@ -35,6 +37,7 @@ async def run_integrity_check(store: EventStore, entity_type: str, entity_id: st
 
     primary_events = await store.load_stream(primary_stream_id, from_position=0)
     audit_events = await store.load_stream(audit_stream_id, from_position=0)
+    audit_aggregate = await AuditLedgerAggregate.load(store, f"{entity_type}-{entity_id}")
 
     prior_check = None
     for event in reversed(audit_events):
@@ -58,6 +61,12 @@ async def run_integrity_check(store: EventStore, entity_type: str, entity_id: st
     expected_total = previously_verified + len(events_to_verify)
     tamper_detected = len(primary_events) < previously_verified
     chain_valid = chain_valid and not tamper_detected
+
+    if audit_aggregate.checks_run > 0:
+        if audit_aggregate.last_integrity_hash != previous_hash:
+            raise DomainError("AuditLedger aggregate chain head does not match the prior integrity event")
+        if expected_total < audit_aggregate.last_verified_count:
+            raise DomainError("AuditLedger aggregate forbids reducing the verified event count")
 
     check_event = AuditIntegrityCheckRun(
         entity_type=entity_type,

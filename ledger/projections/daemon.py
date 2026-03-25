@@ -20,17 +20,20 @@ class ProjectionDaemon:
     ):
         self.store = store
         self.projections = list(projections or [])
+        self._projection_map = {projection.checkpoint_name: projection for projection in self.projections}
         self.batch_size = batch_size
         self.poll_interval = poll_interval
         self.max_retries = max_retries
         self.logger = logger or logging.getLogger(__name__)
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
+        self._running = False
         self._retry_counts: dict[tuple[str, str], int] = defaultdict(int)
         self._projection_last_processed_at: dict[str, datetime] = {}
 
     def subscribe(self, projection) -> None:
         self.projections.append(projection)
+        self._projection_map[projection.checkpoint_name] = projection
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -40,10 +43,12 @@ class ProjectionDaemon:
             if callable(setup):
                 await setup()
         self._stop_event.clear()
+        self._running = True
         self._task = asyncio.create_task(self._run(), name="projection-daemon")
 
     async def stop(self) -> None:
         self._stop_event.set()
+        self._running = False
         if self._task is not None:
             await self._task
             self._task = None
@@ -51,7 +56,7 @@ class ProjectionDaemon:
     async def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
-                await self.run_once()
+                await self._process_batch()
             except Exception:
                 self.logger.exception("Projection daemon loop failed unexpectedly; continuing")
             try:
@@ -67,11 +72,25 @@ class ProjectionDaemon:
 
     async def _fetch_batch(self, from_position: int) -> list:
         events = []
-        async for event in self.store.load_all(from_position=from_position, batch_size=self.batch_size):
+        async for event in self.store.load_all(from_global_position=from_position, batch_size=self.batch_size):
             events.append(event)
             if len(events) >= self.batch_size:
                 break
         return events
+
+    async def run_forever(self, poll_interval_ms: int = 100) -> None:
+        self.poll_interval = poll_interval_ms / 1000
+        self._running = True
+        for projection in self.projections:
+            setup = getattr(projection, "setup", None)
+            if callable(setup):
+                await setup()
+        while self._running:
+            await self._process_batch()
+            await asyncio.sleep(self.poll_interval)
+
+    async def _process_batch(self) -> int:
+        return await self.run_once()
 
     async def run_once(self) -> int:
         if not self.projections:
@@ -230,3 +249,10 @@ class ProjectionDaemon:
             "latest_global_position": latest["global_position"],
             "projections": projection_lags,
         }
+
+    async def get_projection_lag(self, checkpoint_name: str) -> dict[str, Any]:
+        all_lags = await self.get_all_lags()
+        projection_lag = all_lags["projections"].get(checkpoint_name)
+        if projection_lag is None:
+            raise ValueError(f"Unknown projection checkpoint '{checkpoint_name}'")
+        return dict(projection_lag)

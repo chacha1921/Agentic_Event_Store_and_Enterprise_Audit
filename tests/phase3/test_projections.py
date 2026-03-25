@@ -8,6 +8,7 @@ import pytest
 import pytest_asyncio
 
 from ledger.event_store import InMemoryEventStore
+from ledger.commands.handlers import SubmitApplicationCommand, handle_submit_application
 from ledger.projections import (
     AgentPerformanceLedger,
     ApplicationSummary,
@@ -28,6 +29,7 @@ from ledger.schema.events import (
     CreditAnalysisCompleted,
     CreditDecision,
     DecisionGenerated,
+    HumanReviewCompleted,
     LoanPurpose,
     RiskTier,
 )
@@ -116,6 +118,8 @@ async def test_projection_daemon_updates_application_summary(store: InMemoryEven
     assert row["risk_tier"] == "MEDIUM"
     assert row["final_decision"] == "APPROVED"
     assert row["state"] == "APPROVED"
+    assert row["last_event_type"] == "ApplicationApproved"
+    assert row["final_decision_at"] is not None
 
 
 @pytest.mark.asyncio
@@ -181,6 +185,23 @@ async def test_agent_performance_ledger_aggregates_metrics(store: InMemoryEventS
             completed_at=datetime.now(),
         ).to_store_dict(),
     )
+    await _append(
+        store,
+        f"loan-APEX-PROJ-002",
+        HumanReviewCompleted(
+            application_id="APEX-PROJ-002",
+            reviewer_id="reviewer-7",
+            override=True,
+            original_recommendation="APPROVE",
+            final_decision="APPROVED",
+            reviewed_at=datetime.now(),
+            override_reason="Manual limit adjustment",
+            approved_amount_usd=Decimal("250000"),
+            interest_rate_pct=7.1,
+            term_months=36,
+            conditions=[],
+        ).to_store_dict(),
+    )
 
     await daemon.run_once()
     metrics = await ledger.get_metrics("orchestrator-1", "claude-sonnet-4-20250514")
@@ -189,10 +210,18 @@ async def test_agent_performance_ledger_aggregates_metrics(store: InMemoryEventS
     assert metrics["sessions_started"] == 1
     assert metrics["sessions_completed"] == 1
     assert metrics["decision_count"] == 1
+    assert metrics["decisions_generated"] == 1
+    assert metrics["analyses_completed"] == 1
     assert metrics["approve_count"] == 1
     assert metrics["approve_rate"] == pytest.approx(1.0)
     assert metrics["avg_confidence"] == pytest.approx(0.81)
+    assert metrics["avg_confidence_score"] == pytest.approx(0.81)
+    assert metrics["decline_rate"] == pytest.approx(0.0)
+    assert metrics["refer_rate"] == pytest.approx(0.0)
+    assert metrics["human_override_rate"] == pytest.approx(1.0)
     assert metrics["avg_duration_ms"] == pytest.approx(1800.0)
+    assert metrics["first_seen_at"] is not None
+    assert metrics["last_seen_at"] is not None
 
 
 @pytest.mark.asyncio
@@ -245,15 +274,21 @@ async def test_compliance_audit_supports_temporal_queries_and_rebuild(store: InM
     await daemon.run_once()
 
     before_completion = await audit.get_compliance_at(app_id, t2)
+    before_completion_alias = await audit.get_state_at(app_id, t2)
     after_completion = await audit.get_compliance_at(app_id, datetime.now())
+    current = await audit.get_current_compliance(app_id)
 
     assert before_completion is not None
+    assert before_completion_alias == before_completion
     assert before_completion["has_hard_block"] is True
     assert before_completion["overall_verdict"] is None
+    assert before_completion["rule_results"][0]["rule_version"] == "2026-Q1"
 
     assert after_completion is not None
     assert after_completion["overall_verdict"] == "BLOCKED"
     assert after_completion["rules_failed"] == 1
+    assert current is not None
+    assert current["overall_verdict"] == "BLOCKED"
 
     await audit.rebuild_from_scratch()
     rebuilt = await audit.get_current(app_id)
@@ -281,7 +316,48 @@ async def test_projection_daemon_reports_lag_and_tolerates_failures(store: InMem
 
     row = await summary.get(app_id)
     lag = await daemon.get_lag()
+    summary_lag = await daemon.get_projection_lag(summary.checkpoint_name)
+    projection_lag = await summary.get_projection_lag()
 
     assert row is not None
     assert lag["latest_global_position"] >= lag["processed_position"]
     assert lag["position_lag"] >= 0
+    assert summary_lag["position_lag"] >= 0
+    assert projection_lag["position_lag"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_projection_daemon_slo_with_concurrent_command_handlers(store: InMemoryEventStore):
+    summary = ApplicationSummary(store)
+    audit = ComplianceAuditView(store)
+    daemon = ProjectionDaemon(store, [summary, audit], batch_size=500, poll_interval=0.01)
+
+    async def submit_one(index: int) -> None:
+        app_id = f"CMD-{index:03d}"
+        await handle_submit_application(
+            store,
+            SubmitApplicationCommand(
+                application_id=app_id,
+                applicant_id=f"COMP-{index:03d}",
+                requested_amount_usd=Decimal("500000"),
+                loan_purpose=LoanPurpose.WORKING_CAPITAL,
+                loan_term_months=36,
+                submission_channel="web",
+                contact_email="borrower@example.com",
+                contact_name="Borrower One",
+                submitted_at=datetime.now(),
+                application_reference=app_id,
+                deadline=datetime.now() + timedelta(days=7),
+            ),
+        )
+
+    await asyncio.gather(*(submit_one(index) for index in range(50)))
+    await daemon.run_once()
+
+    app_lag = await summary.get_projection_lag()
+    audit_lag = await audit.get_projection_lag()
+
+    assert app_lag["position_lag"] == 0
+    assert app_lag["milliseconds_lag"] <= 500
+    assert audit_lag["position_lag"] == 0
+    assert audit_lag["milliseconds_lag"] <= 2000

@@ -25,7 +25,7 @@ from ledger.commands.handlers import (
     handle_submit_application,
 )
 from ledger.domain.errors import DomainError
-from ledger.event_store import EventStore, OptimisticConcurrencyError
+from ledger.event_store import EventStore, OptimisticConcurrencyError, assigned_positions_from_new_version
 from ledger.integrity import run_integrity_check as run_integrity_check_impl
 from ledger.projections import (
     AgentPerformanceLedger,
@@ -33,7 +33,7 @@ from ledger.projections import (
     ComplianceAuditView,
     ProjectionDaemon,
 )
-from ledger.schema.events import AgentSessionStarted, AgentType
+from ledger.schema.events import AgentContextLoaded, AgentSessionStarted, AgentType
 
 
 def _json_default(value: Any) -> Any:
@@ -253,6 +253,9 @@ def create_mcp_server(
 
         try:
             await context.ensure_ready()
+            loaded_at = command["started_at"]
+            if isinstance(loaded_at, str):
+                loaded_at = datetime.fromisoformat(loaded_at)
             start_event = AgentSessionStarted.model_validate(command).to_store_dict()
             agent_type = command.get("agent_type")
             if isinstance(agent_type, AgentType):
@@ -261,9 +264,23 @@ def create_mcp_server(
             expected_version = await context.store.stream_version(stream_id)
             if expected_version != -1:
                 raise DomainError(f"Agent session '{command['session_id']}' already exists for {agent_type}")
-            positions = await context.store.append(stream_id, [start_event], expected_version=-1)
+            context_loaded_event = AgentContextLoaded(
+                session_id=command["session_id"],
+                agent_type=command["agent_type"],
+                application_id=command["application_id"],
+                context_source=command["context_source"],
+                context_token_count=command["context_token_count"],
+                loaded_at=loaded_at,
+            ).to_store_dict()
+            new_version = await context.store.append(stream_id, [context_loaded_event, start_event], expected_version=-1)
             await context.refresh_projections()
-            return _json_response({"status": "ok", "stream_id": stream_id, "stream_positions": positions})
+            return _json_response(
+                {
+                    "status": "ok",
+                    "stream_id": stream_id,
+                    "stream_positions": assigned_positions_from_new_version(new_version, 2),
+                }
+            )
         except (OptimisticConcurrencyError, DomainError, ValidationError, ValueError, RuntimeError) as exc:
             return _structured_error(exc)
 

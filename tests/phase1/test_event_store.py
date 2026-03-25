@@ -30,12 +30,12 @@ async def test_new_stream_version_is_minus_one():
 @pytest.mark.asyncio
 async def test_append_new_stream_succeeds():
     store = InMemoryEventStore()
-    positions = await store.append(
+    new_version = await store.append(
         "loan-APEX-0001",
         [_ev("ApplicationSubmitted", application_id="APEX-0001")],
         expected_version=-1,
     )
-    assert positions == [0]
+    assert new_version == 0
     assert await store.stream_version("loan-APEX-0001") == 0
 
 @pytest.mark.asyncio
@@ -106,7 +106,7 @@ async def test_load_all_yields_all_events_globally():
     await store.append("s1", [_ev("E1"), _ev("E2")], expected_version=-1)
     await store.append("s2", [_ev("E3")], expected_version=-1)
 
-    all_events = [e async for e in store.load_all(from_position=0)]
+    all_events = [e async for e in store.load_all(from_global_position=0)]
     assert len(all_events) == 3
 
 @pytest.mark.asyncio
@@ -120,9 +120,20 @@ async def test_checkpoints_persist():
 async def test_append_multiple_events_in_one_call():
     store = InMemoryEventStore()
     events = [_ev(f"E{i}") for i in range(3)]
-    positions = await store.append("s", events, expected_version=-1)
-    assert positions == [0, 1, 2]
+    new_version = await store.append("s", events, expected_version=-1)
+    assert new_version == 2
     assert await store.stream_version("s") == 2
+
+
+@pytest.mark.asyncio
+async def test_load_all_supports_event_type_filter():
+    store = InMemoryEventStore()
+    await store.append("loan-A", [_ev("ApplicationSubmitted")], expected_version=-1)
+    await store.append("loan-B", [_ev("DecisionGenerated")], expected_version=-1)
+
+    filtered = [e async for e in store.load_all(from_global_position=0, event_types=["DecisionGenerated"])]
+    assert len(filtered) == 1
+    assert filtered[0]["event_type"] == "DecisionGenerated"
 
 
 @pytest.mark.asyncio

@@ -66,6 +66,7 @@ class LoanApplicationAggregate:
     human_review_requested: bool = False
     human_review_completed: bool = False
     final_decision: str | None = None
+    contributing_sessions: list[str] = field(default_factory=list)
     decline_reasons: list[str] = field(default_factory=list)
     _events: list[dict] = field(default_factory=list)
 
@@ -141,6 +142,11 @@ class LoanApplicationAggregate:
 
     def _on_DecisionGenerated(self, event, _: dict) -> None:
         self._ensure(self.state == LoanApplicationState.PENDING_DECISION, "DecisionGenerated is only valid in PendingDecision state")
+        self._ensure(bool(event.contributing_sessions), "DecisionGenerated requires contributing_sessions for causal traceability")
+        self._ensure(
+            len(set(event.contributing_sessions)) == len(event.contributing_sessions),
+            "DecisionGenerated contributing_sessions must be unique",
+        )
         recommendation = event.recommendation.upper()
         confidence = float(event.confidence)
         if confidence < 0.60:
@@ -150,6 +156,7 @@ class LoanApplicationAggregate:
         self.decision_generated = True
         self.decision_confidence = confidence
         self.recommendation = recommendation
+        self.contributing_sessions = list(event.contributing_sessions)
         if recommendation == "APPROVE":
             self._transition(LoanApplicationState.APPROVED_PENDING_HUMAN)
         elif recommendation == "DECLINE":
@@ -195,6 +202,22 @@ class LoanApplicationAggregate:
             self.mark_package_ready()
         self.assert_awaiting_credit_analysis()
 
+    async def assert_credit_analysis_writable(self, store) -> None:
+        credit_events = await store.load_stream(f"credit-{self.application_id}")
+        completed_events = [event for event in credit_events if event.get("event_type") == "CreditAnalysisCompleted"]
+        if not completed_events:
+            return
+        override_events = [
+            event
+            for event in self._events
+            if event.get("event_type") == "HumanReviewCompleted"
+            and bool((event.get("payload") or {}).get("override"))
+        ]
+        self._ensure(
+            bool(override_events),
+            "Credit analysis already completed and cannot be written again unless superseded by a human override",
+        )
+
     def mark_compliance_completed(self, has_hard_block: bool) -> None:
         self.compliance_completed = True
         self.compliance_hard_block = has_hard_block
@@ -212,4 +235,21 @@ class LoanApplicationAggregate:
 
     def assert_pending_decision(self) -> None:
         self._ensure(self.state == LoanApplicationState.PENDING_DECISION, "Application is not pending a decision")
+
+    def assert_human_review_completable(self) -> None:
+        self._ensure(self.decision_generated or self.human_review_requested, "Human review cannot complete before a decision is generated")
+
+    async def assert_approval_requirements_satisfied(self, store) -> None:
+        from ledger.domain.aggregates.compliance_record import ComplianceRecordAggregate
+
+        compliance = await ComplianceRecordAggregate.load(store, self.application_id)
+        self._ensure(compliance.completed, "Application approval requires completed compliance review")
+        self._ensure(not compliance.has_hard_block, "Application approval is invalid after a compliance hard block")
+        self._ensure(not compliance.failed_rule_ids, "Application approval requires all required compliance checks to pass")
+        satisfied_rule_ids = compliance.passed_rule_ids | compliance.noted_rule_ids
+        missing_rules = compliance.rules_to_evaluate - satisfied_rule_ids
+        self._ensure(
+            not missing_rules,
+            f"Application approval requires all required compliance checks to be satisfied; missing {sorted(missing_rules)}",
+        )
 

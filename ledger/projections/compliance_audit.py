@@ -119,6 +119,7 @@ class ComplianceAuditView:
             snapshot["rule_results"] = snapshot["rule_results"] + [{
                 "rule_id": payload.get("rule_id"),
                 "rule_name": payload.get("rule_name"),
+                "rule_version": payload.get("rule_version") or snapshot.get("regulation_set_version"),
                 "status": "PASSED",
                 "evaluated_at": payload.get("evaluated_at"),
             }]
@@ -126,6 +127,7 @@ class ComplianceAuditView:
             snapshot["rule_results"] = snapshot["rule_results"] + [{
                 "rule_id": payload.get("rule_id"),
                 "rule_name": payload.get("rule_name"),
+                "rule_version": payload.get("rule_version") or snapshot.get("regulation_set_version"),
                 "status": "FAILED",
                 "is_hard_block": bool(payload.get("is_hard_block", False)),
                 "evaluated_at": payload.get("evaluated_at"),
@@ -136,6 +138,7 @@ class ComplianceAuditView:
             snapshot["note_results"] = snapshot["note_results"] + [{
                 "rule_id": payload.get("rule_id"),
                 "rule_name": payload.get("rule_name"),
+                "rule_version": payload.get("rule_version") or snapshot.get("regulation_set_version"),
                 "note_type": payload.get("note_type"),
                 "note_text": payload.get("note_text"),
                 "evaluated_at": payload.get("evaluated_at"),
@@ -276,6 +279,9 @@ class ComplianceAuditView:
         current = self._current.get(application_id)
         return dict(current) if current is not None else None
 
+    async def get_current_compliance(self, application_id: str) -> dict[str, Any] | None:
+        return await self.get_current(application_id)
+
     def _normalize_timestamp(self, value: datetime) -> datetime:
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
@@ -315,6 +321,9 @@ class ComplianceAuditView:
         history.sort(key=lambda snapshot: (snapshot["as_of_recorded_at"], snapshot["as_of_global_position"]), reverse=True)
         return dict(history[0])
 
+    async def get_state_at(self, application_id: str, timestamp: datetime) -> dict[str, Any] | None:
+        return await self.get_compliance_at(application_id, timestamp)
+
     async def rebuild_from_scratch(self) -> None:
         await self.setup()
         pool_getter = getattr(self.store, "_require_pool", None)
@@ -332,7 +341,7 @@ class ComplianceAuditView:
                 await conn.execute(f"DROP TABLE IF EXISTS {shadow_history}")
                 await self._create_tables(conn, shadow_current, shadow_history)
 
-        async for event in self.store.load_all(from_position=0):
+        async for event in self.store.load_all(from_global_position=0):
             payload = event.payload
             application_id = payload.get("application_id")
             if not application_id:
@@ -371,3 +380,22 @@ class ComplianceAuditView:
 
         self._current = snapshots
         self._history = histories
+
+    async def get_projection_lag(self) -> dict[str, Any]:
+        checkpoint = await self.store.load_checkpoint(self.checkpoint_name)
+        latest_event = None
+        async for event in self.store.load_all(from_global_position=max(checkpoint - 1, 0), batch_size=500):
+            latest_event = event
+        if latest_event is None:
+            return {"processed_position": checkpoint - 1, "position_lag": 0, "milliseconds_lag": 0}
+        processed_position = checkpoint - 1
+        last_snapshot_at = max(
+            (snapshot.get("as_of_recorded_at") for snapshot in self._current.values()),
+            default=None,
+        )
+        milliseconds_lag = 0 if last_snapshot_at is None else max(0, int((latest_event.recorded_at - last_snapshot_at).total_seconds() * 1000))
+        return {
+            "processed_position": processed_position,
+            "position_lag": max(0, latest_event.global_position - processed_position),
+            "milliseconds_lag": milliseconds_lag,
+        }

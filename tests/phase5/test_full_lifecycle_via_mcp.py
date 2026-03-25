@@ -51,13 +51,6 @@ async def mcp_server():
         daemon=daemon,
     )
     return mcp
-
-
-async def _append(store: InMemoryEventStore, stream_id: str, event: dict) -> None:
-    version = await store.stream_version(stream_id)
-    await store.append(stream_id, [event], expected_version=version)
-
-
 async def _call_tool_json(mcp, tool_name: str, **arguments):
     result = await mcp.call_tool(tool_name, arguments)
     payload = json.loads(result.structured_content["result"])
@@ -73,7 +66,6 @@ async def _read_resource_json(mcp, uri: str):
 @pytest.mark.asyncio
 async def test_full_lifecycle_via_mcp_tools_and_resources(mcp_server):
     mcp = mcp_server
-    store = mcp.ledger_context.store
     application_id = "APEX-MCP-001"
     orchestrator_session_id = "sess-orc-mcp-001"
     now = datetime.now()
@@ -112,50 +104,50 @@ async def test_full_lifecycle_via_mcp_tools_and_resources(mcp_server):
     }
     submit_response, _ = await _call_tool_json(mcp, "submit_application", command=submit_payload)
 
-    await _append(
-        store,
-        f"loan-{application_id}",
-        CreditAnalysisRequested(
-            application_id=application_id,
-            requested_at=now,
-            requested_by="system",
-            priority="NORMAL",
-        ).to_store_dict(),
+    credit_session_response, _ = await _call_tool_json(
+        mcp,
+        "start_agent_session",
+        command={
+            "session_id": "sess-crd-mcp-001",
+            "agent_type": "credit_analysis",
+            "agent_id": "credit-agent-1",
+            "application_id": application_id,
+            "model_version": "claude-sonnet-4-20250514",
+            "langgraph_graph_version": "graph-v1",
+            "context_source": "loan-stream",
+            "context_token_count": 384,
+            "started_at": (now + timedelta(seconds=30)).isoformat(),
+        },
     )
-    await _append(
-        store,
-        f"docpkg-{application_id}",
-        PackageReadyForAnalysis(
-            package_id=application_id,
-            application_id=application_id,
-            documents_processed=3,
-            has_quality_flags=False,
-            quality_flag_count=0,
-            ready_at=now,
-        ).to_store_dict(),
+    fraud_session_response, _ = await _call_tool_json(
+        mcp,
+        "start_agent_session",
+        command={
+            "session_id": "sess-frd-mcp-001",
+            "agent_type": "fraud_detection",
+            "agent_id": "fraud-agent-1",
+            "application_id": application_id,
+            "model_version": "fraud-v2026.03",
+            "langgraph_graph_version": "graph-v1",
+            "context_source": "loan-stream",
+            "context_token_count": 192,
+            "started_at": (now + timedelta(seconds=45)).isoformat(),
+        },
     )
-    await _append(
-        store,
-        f"credit-{application_id}",
-        CreditAnalysisCompleted(
-            application_id=application_id,
-            session_id="sess-crd-mcp-001",
-            decision=CreditDecision(
-                risk_tier=RiskTier.MEDIUM,
-                recommended_limit_usd=Decimal("350000"),
-                confidence=0.72,
-                rationale="Stable business with manageable leverage.",
-                key_concerns=["Customer concentration"],
-                data_quality_caveats=[],
-                policy_overrides_applied=[],
-            ),
-            model_version="claude-sonnet-4-20250514",
-            model_deployment_id="dep-credit-mcp-001",
-            input_data_hash="hash-credit-mcp-001",
-            analysis_duration_ms=1350,
-            regulatory_basis=["CREDIT-POLICY-2026-01"],
-            completed_at=now,
-        ).to_store_dict(),
+    compliance_session_response, _ = await _call_tool_json(
+        mcp,
+        "start_agent_session",
+        command={
+            "session_id": "sess-cmp-mcp-001",
+            "agent_type": "compliance",
+            "agent_id": "compliance-agent-1",
+            "application_id": application_id,
+            "model_version": "rules-v2026.03",
+            "langgraph_graph_version": "graph-v1",
+            "context_source": "loan-stream",
+            "context_token_count": 224,
+            "started_at": (now + timedelta(minutes=1)).isoformat(),
+        },
     )
 
     credit_response, _ = await _call_tool_json(
@@ -163,25 +155,50 @@ async def test_full_lifecycle_via_mcp_tools_and_resources(mcp_server):
         "record_credit_analysis",
         command={
             "application_id": application_id,
+            "session_id": "sess-crd-mcp-001",
+            "model_version": "claude-sonnet-4-20250514",
             "triggered_by_event_id": "credit-completed-mcp-001",
             "requested_at": (now + timedelta(minutes=1)).isoformat(),
+            "loan_source_events": [
+                CreditAnalysisRequested(
+                    application_id=application_id,
+                    requested_at=now,
+                    requested_by="system",
+                    priority="NORMAL",
+                ).to_store_dict()
+            ],
+            "document_package_source_events": [
+                PackageReadyForAnalysis(
+                    package_id=application_id,
+                    application_id=application_id,
+                    documents_processed=3,
+                    has_quality_flags=False,
+                    quality_flag_count=0,
+                    ready_at=now,
+                ).to_store_dict()
+            ],
+            "source_events": [
+                CreditAnalysisCompleted(
+                    application_id=application_id,
+                    session_id="sess-crd-mcp-001",
+                    decision=CreditDecision(
+                        risk_tier=RiskTier.MEDIUM,
+                        recommended_limit_usd=Decimal("350000"),
+                        confidence=0.72,
+                        rationale="Stable business with manageable leverage.",
+                        key_concerns=["Customer concentration"],
+                        data_quality_caveats=[],
+                        policy_overrides_applied=[],
+                    ),
+                    model_version="claude-sonnet-4-20250514",
+                    model_deployment_id="dep-credit-mcp-001",
+                    input_data_hash="hash-credit-mcp-001",
+                    analysis_duration_ms=1350,
+                    regulatory_basis=["CREDIT-POLICY-2026-01"],
+                    completed_at=now,
+                ).to_store_dict()
+            ],
         },
-    )
-
-    await _append(
-        store,
-        f"fraud-{application_id}",
-        FraudScreeningCompleted(
-            application_id=application_id,
-            session_id="sess-frd-mcp-001",
-            fraud_score=0.18,
-            risk_level="LOW",
-            anomalies_found=0,
-            recommendation="CLEAR",
-            screening_model_version="fraud-v2026.03",
-            input_data_hash="hash-fraud-mcp-001",
-            completed_at=now + timedelta(minutes=2),
-        ).to_store_dict(),
     )
 
     fraud_response, _ = await _call_tool_json(
@@ -189,53 +206,23 @@ async def test_full_lifecycle_via_mcp_tools_and_resources(mcp_server):
         "record_fraud_screening",
         command={
             "application_id": application_id,
+            "session_id": "sess-frd-mcp-001",
             "triggered_by_event_id": "fraud-completed-mcp-001",
             "requested_at": (now + timedelta(minutes=2)).isoformat(),
+            "source_events": [
+                FraudScreeningCompleted(
+                    application_id=application_id,
+                    session_id="sess-frd-mcp-001",
+                    fraud_score=0.18,
+                    risk_level="LOW",
+                    anomalies_found=0,
+                    recommendation="CLEAR",
+                    screening_model_version="fraud-v2026.03",
+                    input_data_hash="hash-fraud-mcp-001",
+                    completed_at=now + timedelta(minutes=2),
+                ).to_store_dict()
+            ],
         },
-    )
-
-    await store.append(
-        f"compliance-{application_id}",
-        [
-            ComplianceCheckInitiated(
-                application_id=application_id,
-                session_id="sess-cmp-mcp-001",
-                regulation_set_version="2026-Q1",
-                rules_to_evaluate=["REG-001", "REG-004"],
-                initiated_at=now + timedelta(minutes=3),
-            ).to_store_dict(),
-            ComplianceRulePassed(
-                application_id=application_id,
-                session_id="sess-cmp-mcp-001",
-                rule_id="REG-001",
-                rule_name="KYC documents complete",
-                rule_version="2026-Q1",
-                evidence_hash="evidence-pass-001",
-                evaluation_notes="No issues detected.",
-                evaluated_at=now + timedelta(minutes=4),
-            ).to_store_dict(),
-            ComplianceRuleNoted(
-                application_id=application_id,
-                session_id="sess-cmp-mcp-001",
-                rule_id="REG-004",
-                rule_name="Enhanced monitoring",
-                note_type="INFO",
-                note_text="Quarterly covenant review required.",
-                evaluated_at=now + timedelta(minutes=4),
-            ).to_store_dict(),
-            ComplianceCheckCompleted(
-                application_id=application_id,
-                session_id="sess-cmp-mcp-001",
-                rules_evaluated=2,
-                rules_passed=1,
-                rules_failed=0,
-                rules_noted=1,
-                has_hard_block=False,
-                overall_verdict=ComplianceVerdict.CLEAR,
-                completed_at=now + timedelta(minutes=5),
-            ).to_store_dict(),
-        ],
-        expected_version=-1,
     )
 
     compliance_response, _ = await _call_tool_json(
@@ -243,11 +230,51 @@ async def test_full_lifecycle_via_mcp_tools_and_resources(mcp_server):
         "record_compliance_check",
         command={
             "application_id": application_id,
+            "session_id": "sess-cmp-mcp-001",
             "triggered_by_event_id": "compliance-completed-mcp-001",
             "requested_at": (now + timedelta(minutes=5)).isoformat(),
             "has_hard_block": False,
             "decline_reasons": [],
             "adverse_action_codes": [],
+            "source_events": [
+                ComplianceCheckInitiated(
+                    application_id=application_id,
+                    session_id="sess-cmp-mcp-001",
+                    regulation_set_version="2026-Q1",
+                    rules_to_evaluate=["REG-001", "REG-004"],
+                    initiated_at=now + timedelta(minutes=3),
+                ).to_store_dict(),
+                ComplianceRulePassed(
+                    application_id=application_id,
+                    session_id="sess-cmp-mcp-001",
+                    rule_id="REG-001",
+                    rule_name="KYC documents complete",
+                    rule_version="2026-Q1",
+                    evidence_hash="evidence-pass-001",
+                    evaluation_notes="No issues detected.",
+                    evaluated_at=now + timedelta(minutes=4),
+                ).to_store_dict(),
+                ComplianceRuleNoted(
+                    application_id=application_id,
+                    session_id="sess-cmp-mcp-001",
+                    rule_id="REG-004",
+                    rule_name="Enhanced monitoring",
+                    note_type="INFO",
+                    note_text="Quarterly covenant review required.",
+                    evaluated_at=now + timedelta(minutes=4),
+                ).to_store_dict(),
+                ComplianceCheckCompleted(
+                    application_id=application_id,
+                    session_id="sess-cmp-mcp-001",
+                    rules_evaluated=2,
+                    rules_passed=1,
+                    rules_failed=0,
+                    rules_noted=1,
+                    has_hard_block=False,
+                    overall_verdict=ComplianceVerdict.CLEAR,
+                    completed_at=now + timedelta(minutes=5),
+                ).to_store_dict(),
+            ],
         },
     )
 
@@ -296,7 +323,10 @@ async def test_full_lifecycle_via_mcp_tools_and_resources(mcp_server):
 
     assert start_response["status"] == "ok"
     assert start_response["stream_id"] == f"agent-decision_orchestrator-{orchestrator_session_id}"
-    assert start_response["stream_positions"] == [0]
+    assert start_response["stream_positions"] == [0, 1]
+    assert credit_session_response["status"] == "ok"
+    assert fraud_session_response["status"] == "ok"
+    assert compliance_session_response["status"] == "ok"
 
     assert submit_response["status"] == "ok"
     assert submit_response["stream_positions"] == [0, 1]

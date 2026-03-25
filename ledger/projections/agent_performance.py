@@ -276,3 +276,22 @@ class AgentPerformanceLedger:
                     return dict(row)
         metrics = self._metrics.get((agent_id, model_version))
         return dict(metrics) if metrics is not None else None
+
+    async def list_metrics(self, agent_id: str) -> list[dict[str, Any]]:
+        pool_getter = getattr(self.store, "_require_pool", None)
+        if callable(pool_getter) and self._initialized:
+            pool = pool_getter()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    f"SELECT * FROM {self.metrics_table} WHERE agent_id = $1 ORDER BY model_version ASC",
+                    agent_id,
+                )
+                return [dict(row) for row in rows]
+
+        rows = [
+            dict(metrics)
+            for (stored_agent_id, _), metrics in self._metrics.items()
+            if stored_agent_id == agent_id
+        ]
+        rows.sort(key=lambda row: row.get("model_version") or "")
+        return rows

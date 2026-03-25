@@ -177,6 +177,9 @@ async def handle_credit_analysis_completed(store, cmd: CreditAnalysisCompletedCo
 
 async def handle_fraud_screening_completed(store, cmd: FraudScreeningCompletedCommand) -> list[int]:
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
+    package_events = await store.load_stream(f"docpkg-{cmd.application_id}")
+    if any(event.get("event_type") == "PackageReadyForAnalysis" for event in package_events):
+        app.mark_package_ready()
     app.assert_awaiting_credit_analysis()
 
     compliance_requested = ComplianceCheckRequested(
@@ -266,7 +269,6 @@ async def handle_decision_generated(store, cmd: DecisionGeneratedCommand) -> lis
         f"loan-{cmd.application_id}",
         events,
         expected_version=app.version,
-        **_trace_kwargs(cmd),
         **_trace_kwargs(cmd),
     )
 

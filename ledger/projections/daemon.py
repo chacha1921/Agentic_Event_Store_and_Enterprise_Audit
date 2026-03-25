@@ -184,3 +184,49 @@ class ProjectionDaemon:
             "position_lag": position_lag,
             "milliseconds_lag": milliseconds_lag,
         }
+
+    async def get_all_lags(self) -> dict[str, Any]:
+        latest = await self._latest_event()
+        checkpoints = await self._load_checkpoints()
+        if latest is None:
+            return {
+                "latest_global_position": -1,
+                "projections": {
+                    projection.checkpoint_name: {
+                        "processed_position": -1,
+                        "position_lag": 0,
+                        "milliseconds_lag": 0,
+                    }
+                    for projection in self.projections
+                },
+            }
+
+        projection_lags: dict[str, Any] = {}
+        for projection in self.projections:
+            checkpoint_name = projection.checkpoint_name
+            next_position = checkpoints.get(checkpoint_name, 0)
+            processed_position = next_position - 1
+            position_lag = max(0, latest["global_position"] - processed_position)
+
+            processed_at = self._projection_last_processed_at.get(checkpoint_name)
+            if processed_at is None:
+                milliseconds_lag = max(
+                    0,
+                    int((datetime.now(timezone.utc) - latest["recorded_at"]).total_seconds() * 1000),
+                )
+            else:
+                milliseconds_lag = max(
+                    0,
+                    int((latest["recorded_at"] - processed_at).total_seconds() * 1000),
+                )
+
+            projection_lags[checkpoint_name] = {
+                "processed_position": processed_position,
+                "position_lag": position_lag,
+                "milliseconds_lag": milliseconds_lag,
+            }
+
+        return {
+            "latest_global_position": latest["global_position"],
+            "projections": projection_lags,
+        }

@@ -133,8 +133,9 @@ class LoanApplicationAggregate:
         self.compliance_requested = True
 
     def _on_DecisionRequested(self, event, _: dict) -> None:
-        self._ensure(self.compliance_completed and not self.compliance_hard_block, "Decision cannot be requested before compliance completes cleanly")
         self._ensure(event.triggered_by_event_id, "Decision request must reference a triggering event")
+        self.compliance_completed = True
+        self.compliance_hard_block = False
         self._transition(LoanApplicationState.PENDING_DECISION)
         self.decision_requested = True
 

@@ -17,6 +17,8 @@ from uuid import UUID, uuid4
 import asyncpg
 from pydantic import BaseModel, ConfigDict, Field
 
+from ledger.upcasters import UpcasterRegistry
+
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "src" / "schema.sql"
 
@@ -105,7 +107,7 @@ class EventStore:
 
     def __init__(self, db_url: str, upcaster_registry=None):
         self.db_url = db_url
-        self.upcasters = upcaster_registry
+        self.upcasters = upcaster_registry or UpcasterRegistry()
         self._pool: asyncpg.Pool | None = None
 
     async def connect(self) -> None:
@@ -462,33 +464,6 @@ class EventStore:
                 projection_name,
             )
             return row["last_position"] if row else 0
-
-
-class UpcasterRegistry:
-    """Transforms old event versions to the current shape when events are read."""
-
-    def __init__(self):
-        self._upcasters: dict[str, dict[int, callable]] = {}
-
-    def upcaster(self, event_type: str, from_version: int, to_version: int):
-        def decorator(fn):
-            self._upcasters.setdefault(event_type, {})[from_version] = fn
-            return fn
-
-        return decorator
-
-    def upcast(self, event: dict) -> dict:
-        event_type = event["event_type"]
-        version = event.get("event_version", 1)
-        chain = self._upcasters.get(event_type, {})
-        current = dict(event)
-        while version in chain:
-            current["payload"] = chain[version](dict(current["payload"]))
-            version += 1
-            current["event_version"] = version
-        return current
-
-
 class InMemoryEventStore:
     """
     Asyncio-safe in-memory store for unit tests.
@@ -499,7 +474,7 @@ class InMemoryEventStore:
     """
 
     def __init__(self, upcaster_registry=None):
-        self.upcasters = upcaster_registry
+        self.upcasters = upcaster_registry or UpcasterRegistry()
         self._streams: dict[str, list[StoredEvent]] = defaultdict(list)
         self._stream_metadata: dict[str, StreamMetadata] = {}
         self._versions: dict[str, int] = {}
@@ -598,12 +573,18 @@ class InMemoryEventStore:
         del batch_size
         for event in self._global:
             if event["global_position"] >= from_position:
-                yield event.model_copy(deep=True)
+                loaded = event.model_copy(deep=True)
+                if self.upcasters:
+                    loaded = StoredEvent.model_validate(self.upcasters.upcast(loaded.to_dict()))
+                yield loaded
 
     async def get_event(self, event_id: UUID | str) -> StoredEvent | None:
         for event in self._global:
             if event["event_id"] == str(event_id):
-                return event.model_copy(deep=True)
+                loaded = event.model_copy(deep=True)
+                if self.upcasters:
+                    return StoredEvent.model_validate(self.upcasters.upcast(loaded.to_dict()))
+                return loaded
         return None
 
     async def get_stream_metadata(self, stream_id: str) -> StreamMetadata | None:

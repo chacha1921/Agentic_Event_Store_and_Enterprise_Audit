@@ -59,6 +59,7 @@ pytest tests/test_schema_and_generator.py -v  # Phase 0: all must pass before Ph
 pytest tests/test_event_store.py -v           # Phase 1
 pytest tests/test_domain.py -v               # Phase 2
 pytest tests/test_narratives.py -v           # Phase 3: all 5 must pass
-pytest tests/test_projections.py -v          # Phase 4
+pytest tests/phase3/test_projections.py -v   # Phase 3 projections/daemon suite
+pytest tests/phase4/test_upcasting_and_integrity.py -v  # Phase 4 upcasting + integrity
 pytest tests/test_mcp.py -v                  # Phase 5
 ```

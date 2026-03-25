@@ -136,19 +136,31 @@ class EventStore:
     def _aggregate_type_for(stream_id: str) -> str:
         return stream_id.split("-", 1)[0] if "-" in stream_id else stream_id
 
+    @staticmethod
+    def _coerce_json_object(value: Any, field_name: str) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if isinstance(value, Mapping):
+            return dict(value)
+        if isinstance(value, str):
+            parsed = json.loads(value)
+            if isinstance(parsed, Mapping):
+                return dict(parsed)
+            raise ValueError(f"Expected '{field_name}' JSON object but found {type(parsed).__name__}")
+        raise ValueError(f"Expected '{field_name}' to be a mapping or JSON string, got {type(value).__name__}")
+
     def _deserialize_event(self, row: asyncpg.Record) -> StoredEvent:
         event = dict(row)
         event["event_id"] = str(event["event_id"])
-        event["payload"] = dict(event.get("payload") or {})
-        event["metadata"] = dict(event.get("metadata") or {})
+        event["payload"] = self._coerce_json_object(event.get("payload"), "payload")
+        event["metadata"] = self._coerce_json_object(event.get("metadata"), "metadata")
         if self.upcasters:
             event = self.upcasters.upcast(event)
         return StoredEvent.model_validate(event)
 
-    @staticmethod
-    def _deserialize_stream_metadata(row: asyncpg.Record) -> StreamMetadata:
+    def _deserialize_stream_metadata(self, row: asyncpg.Record) -> StreamMetadata:
         stream_metadata = dict(row)
-        stream_metadata["metadata"] = dict(stream_metadata.get("metadata") or {})
+        stream_metadata["metadata"] = self._coerce_json_object(stream_metadata.get("metadata"), "metadata")
         return StreamMetadata.model_validate(stream_metadata)
 
     async def stream_version(self, stream_id: str) -> int:

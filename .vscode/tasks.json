@@ -52,6 +52,38 @@
 				"-q"
 			],
 			"isBackground": false
+		},
+		{
+			"label": "post-schema-regression",
+			"type": "shell",
+			"command": "./.venv/bin/python",
+			"args": [
+				"-m",
+				"pytest",
+				"tests/phase1/test_event_store.py",
+				"tests/phase2/test_domain.py",
+				"tests/phase3/test_projections.py",
+				"tests/phase4/test_upcasting_and_integrity.py",
+				"tests/phase5/test_full_lifecycle_via_mcp.py",
+				"-q"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "json-deserialize-regression",
+			"type": "shell",
+			"command": "./.venv/bin/python",
+			"args": [
+				"-m",
+				"pytest",
+				"tests/phase1/test_event_store.py",
+				"tests/phase2/test_domain.py",
+				"tests/phase3/test_projections.py",
+				"tests/phase4/test_upcasting_and_integrity.py",
+				"tests/phase5/test_full_lifecycle_via_mcp.py",
+				"-q"
+			],
+			"isBackground": false
 		}
 	]
 }

@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS events (
     event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     stream_id TEXT NOT NULL,
     stream_position BIGINT NOT NULL,
-    global_position BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 0 INCREMENT BY 1),
+    global_position BIGINT GENERATED ALWAYS AS IDENTITY (MINVALUE 0 START WITH 0 INCREMENT BY 1),
     event_type TEXT NOT NULL,
     event_version SMALLINT NOT NULL DEFAULT 1,
     payload JSONB NOT NULL,
